@@ -1,4 +1,4 @@
-import { useMemo } from 'react'
+import { useMemo, useState } from 'react'
 import { useCandles } from '@/hooks/useCandles'
 import { useWS } from '@/contexts/WebSocketContext'
 import { calcularStats } from '@/utils/candleUtils'
@@ -197,10 +197,202 @@ function PerformanceCard({ taxaGeral, taxaMercadoBom, simulacao, totalBloqueadas
   )
 }
 
+// ── HeatmapCard (novo) ────────────────────────────────────────────────────────
+const BLOCOS5 = ['00','05','10','15','20','25','30','35','40','45','50','55']
+
+function HeatmapCard({ heatmapData, freqPorHora }: {
+  heatmapData: { matrix: number[][]; totals: number[][]; maxVal: number }
+  freqPorHora: { horaNum: number; hora: string; especiais: number; total: number; taxa: number }[]
+}) {
+  const [mode, setMode] = useState<'count' | 'taxa'>('count')
+
+  const horaEsp = useMemo(() =>
+    heatmapData.matrix.map(row => row.reduce((s, v) => s + v, 0)), [heatmapData])
+
+  const maxHoraEsp = Math.max(...horaEsp, 1)
+
+  const top3 = useMemo(() =>
+    freqPorHora
+      .filter(h => h.total > 0)
+      .sort((a, b) => b.especiais - a.especiais)
+      .slice(0, 3),
+  [freqPorHora])
+
+  function getCellValue(h: number, b: number) {
+    if (mode === 'count') return heatmapData.matrix[h][b]
+    const tot = heatmapData.totals[h][b]
+    return tot > 0 ? Math.round(heatmapData.matrix[h][b] / tot * 100) : 0
+  }
+
+  function getCellMax() {
+    if (mode === 'count') return heatmapData.maxVal
+    let m = 0
+    for (let h = 0; h < 24; h++)
+      for (let b = 0; b < 12; b++) {
+        const tot = heatmapData.totals[h][b]
+        if (tot > 0) m = Math.max(m, Math.round(heatmapData.matrix[h][b] / tot * 100))
+      }
+    return m || 1
+  }
+
+  function getCellBg(norm: number) {
+    if (norm <= 0) return 'rgba(255,255,255,0.03)'
+    if (norm > 0.8) return C.pink
+    if (norm > 0.55) return C.purple
+    if (norm > 0.3) return 'hsl(263,50%,38%)'
+    return 'rgba(127,119,221,0.2)'
+  }
+
+  function getCellTextColor(norm: number) {
+    return norm > 0.3 ? 'rgba(255,255,255,0.9)' : 'rgba(255,255,255,0.2)'
+  }
+
+  const cellMax = getCellMax()
+
+  return (
+    <div className="rounded-2xl border border-white/8 bg-white/3 p-4 flex flex-col gap-3 sm:col-span-2">
+      {/* Header */}
+      <div className="flex items-center gap-2.5">
+        <div className="p-1.5 rounded-lg bg-white/5">
+          <Calendar className="h-4 w-4 text-white/50" />
+        </div>
+        <div className="flex-1 min-w-0">
+          <h3 className="text-sm font-semibold text-white/90 leading-none">Heatmap: hora × bloco de 5 min</h3>
+          <p className="text-[11px] text-white/35 mt-0.5">Concentração de roxas e rosas no dia</p>
+        </div>
+        {/* Toggle */}
+        <div className="flex rounded-lg overflow-hidden border border-white/10 shrink-0">
+          {(['count', 'taxa'] as const).map(m => (
+            <button
+              key={m}
+              onClick={() => setMode(m)}
+              className="px-2.5 py-1 text-[11px] font-medium transition-colors"
+              style={{
+                background: mode === m ? 'rgba(127,119,221,0.3)' : 'transparent',
+                color: mode === m ? 'rgba(255,255,255,0.9)' : 'rgba(255,255,255,0.4)',
+              }}
+            >
+              {m === 'count' ? 'Qtd' : 'Taxa %'}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Top 3 horários */}
+      <div className="grid grid-cols-3 gap-2">
+        {top3.map((h, i) => (
+          <div key={h.horaNum} className="rounded-xl bg-white/5 p-2.5 flex flex-col gap-0.5">
+            <span className="text-[10px] text-white/35">#{i + 1} mais ativo</span>
+            <span className="text-base font-bold" style={{ color: i === 0 ? C.pink : i === 1 ? C.purple : C.blue }}>
+              {h.hora}
+            </span>
+            <span className="text-[11px] text-white/50">{h.especiais} esp · {h.taxa}%</span>
+          </div>
+        ))}
+      </div>
+
+      {/* Barra de resumo por hora */}
+      <div>
+        <p className="text-[10px] text-white/30 mb-1">Resumo por hora</p>
+        <div className="flex gap-0.5">
+          {heatmapData.matrix.map((row, h) => {
+            const esp = row.reduce((s, v) => s + v, 0)
+            const norm = maxHoraEsp > 0 ? esp / maxHoraEsp : 0
+            const bg = getCellBg(norm)
+            return (
+              <div
+                key={h}
+                title={`${String(h).padStart(2,'0')}h: ${esp} especiais`}
+                className="flex-1 rounded-sm cursor-default"
+                style={{ height: 20, background: bg, minWidth: 0 }}
+              />
+            )
+          })}
+        </div>
+        <div className="flex justify-between text-[9px] text-white/20 mt-0.5">
+          <span>00h</span><span>06h</span><span>12h</span><span>18h</span><span>23h</span>
+        </div>
+      </div>
+
+      {/* Grade hora × bloco */}
+      <div className="overflow-x-auto -mx-1">
+        <div style={{ minWidth: 340 }}>
+          {/* Header blocos */}
+          <div className="grid gap-0.5 mb-0.5" style={{ gridTemplateColumns: '26px repeat(12, 1fr)' }}>
+            <div />
+            {BLOCOS5.map(b => (
+              <div key={b} className="text-center text-[9px] text-white/30">{b}</div>
+            ))}
+          </div>
+          {/* Linhas */}
+          {heatmapData.matrix.map((row, h) => {
+            const norm = maxHoraEsp > 0 ? horaEsp[h] / maxHoraEsp : 0
+            return (
+              <div key={h} className="grid gap-0.5 mb-0.5" style={{ gridTemplateColumns: '26px repeat(12, 1fr)' }}>
+                {/* Label hora — colorida pela intensidade */}
+                <div
+                  className="text-[10px] flex items-center justify-end pr-1 font-medium"
+                  style={{ color: norm > 0.5 ? C.purple : 'rgba(255,255,255,0.25)' }}
+                >
+                  {String(h).padStart(2, '0')}
+                </div>
+                {row.map((_, b) => {
+                  const val = getCellValue(h, b)
+                  const cellNorm = cellMax > 0 ? val / cellMax : 0
+                  const bg = getCellBg(cellNorm)
+                  const textColor = getCellTextColor(cellNorm)
+                  const label = `${String(h).padStart(2,'0')}:${BLOCOS5[b]} — ${heatmapData.matrix[h][b]} esp de ${heatmapData.totals[h][b]}`
+                  return (
+                    <div
+                      key={b}
+                      title={label}
+                      className="rounded cursor-default flex items-center justify-center"
+                      style={{
+                        background: bg,
+                        height: 20,
+                        fontSize: 9,
+                        color: textColor,
+                        minWidth: 0,
+                      }}
+                    >
+                      {val > 0 ? (mode === 'taxa' ? `${val}%` : val) : ''}
+                    </div>
+                  )
+                })}
+              </div>
+            )
+          })}
+        </div>
+      </div>
+
+      {/* Legenda */}
+      <div className="flex items-center gap-2 flex-wrap">
+        <span className="text-[10px] text-white/30">Intensidade:</span>
+        {[
+          { color: 'rgba(255,255,255,0.03)', label: '0' },
+          { color: 'rgba(127,119,221,0.2)',  label: 'baixo' },
+          { color: 'hsl(263,50%,38%)',       label: 'médio' },
+          { color: C.purple,                 label: 'alto' },
+          { color: C.pink,                   label: 'muito alto' },
+        ].map(leg => (
+          <div key={leg.label} className="flex items-center gap-1">
+            <div className="w-3 h-3 rounded-sm" style={{ background: leg.color, border: '0.5px solid rgba(255,255,255,0.1)' }} />
+            <span className="text-[10px] text-white/30">{leg.label}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+const LIMIT_OPTIONS = [50, 100, 200, 1000] as const
+type LimitOption = typeof LIMIT_OPTIONS[number]
+
 // ── Página Principal ──────────────────────────────────────────────────────────
 export default function ChartsPage() {
+  const [limit, setLimit] = useState<LimitOption>(100)
   const ws = useWS()
-  const { candles: dbCandles } = useCandles({ limit: 500 })
+  const { candles: dbCandles } = useCandles({ limit: 1000 })
 
   const candles = useMemo(() => {
     const wsCandles: any[] = Array.isArray(ws?.candles) ? ws.candles : []
@@ -213,7 +405,8 @@ export default function ChartsPage() {
     for (const c of wsCandles) { if (!map.has(key(c))) map.set(key(c), c) }
     return Array.from(map.values())
       .sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())
-  }, [dbCandles, ws?.candles])
+      .slice(-limit)
+  }, [dbCandles, ws?.candles, limit])
 
   const simulacao = useMemo(() => simularEstrategia(candles), [candles])
 
@@ -393,26 +586,42 @@ export default function ChartsPage() {
     )
   }
 
-  const blocos5min = ['00','05','10','15','20','25','30','35','40','45','50','55']
-
   return (
     <div className="p-3 pb-24 lg:pb-6 space-y-3">
 
       {/* Header */}
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between gap-3 flex-wrap">
         <div>
           <h1 className="text-base font-bold text-white">Análise de Estratégia</h1>
           <p className="text-[11px] text-white/35 mt-0.5">{candles.length} velas · ao vivo</p>
         </div>
-        {ws?.connected && (
-          <span className="flex items-center gap-1.5 text-xs text-emerald-400 font-medium">
-            <span className="relative flex h-2 w-2">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-300 opacity-75" />
-              <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-400" />
+        <div className="flex items-center gap-2">
+          {/* Toggle de quantidade */}
+          <div className="flex rounded-lg overflow-hidden border border-white/10">
+            {LIMIT_OPTIONS.map(l => (
+              <button
+                key={l}
+                onClick={() => setLimit(l)}
+                className="px-2.5 py-1 text-[11px] font-medium transition-colors"
+                style={{
+                  background: limit === l ? 'rgba(127,119,221,0.3)' : 'transparent',
+                  color: limit === l ? 'rgba(255,255,255,0.9)' : 'rgba(255,255,255,0.4)',
+                }}
+              >
+                {l}
+              </button>
+            ))}
+          </div>
+          {ws?.connected && (
+            <span className="flex items-center gap-1.5 text-xs text-emerald-400 font-medium">
+              <span className="relative flex h-2 w-2">
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-300 opacity-75" />
+                <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-400" />
+              </span>
+              ao vivo
             </span>
-            ao vivo
-          </span>
-        )}
+          )}
+        </div>
       </div>
 
       {/* Performance */}
@@ -631,42 +840,10 @@ export default function ChartsPage() {
         ))}
       </div>
 
-      <Card title="Heatmap: hora × bloco de 5 min" subtitle="Concentração de roxas e rosas no dia" icon={Calendar}>
-        <div className="overflow-x-auto -mx-1">
-          <div className="min-w-[300px]">
-            <div className="grid gap-0.5 mb-0.5" style={{ gridTemplateColumns: '26px repeat(12, 1fr)' }}>
-              <div />
-              {blocos5min.map(b => <div key={b} className="text-center text-[9px] text-white/30">{b}</div>)}
-            </div>
-            {heatmapData.matrix.map((row, h) => (
-              <div key={h} className="grid gap-0.5 mb-0.5" style={{ gridTemplateColumns: '26px repeat(12, 1fr)' }}>
-                <div className="text-[10px] text-white/35 flex items-center justify-end pr-1">
-                  {String(h).padStart(2, '0')}
-                </div>
-                {row.map((val, b) => (
-                  <HeatCell key={b} value={val} max={heatmapData.maxVal}
-                    label={`${String(h).padStart(2,'0')}:${blocos5min[b]} — ${val} especiais de ${heatmapData.totals[h][b]}`} />
-                ))}
-              </div>
-            ))}
-            <div className="flex items-center gap-2 mt-2 flex-wrap">
-              <span className="text-[10px] text-white/30">Intensidade:</span>
-              {[
-                { color: 'rgba(255,255,255,0.03)', label: '0' },
-                { color: 'rgba(127,119,221,0.2)',  label: 'baixo' },
-                { color: 'hsl(263,50%,38%)',       label: 'médio' },
-                { color: C.purple,                 label: 'alto' },
-                { color: C.pink,                   label: 'muito alto' },
-              ].map(leg => (
-                <div key={leg.label} className="flex items-center gap-1">
-                  <div className="w-3 h-3 rounded-sm" style={{ background: leg.color, border: '0.5px solid rgba(255,255,255,0.1)' }} />
-                  <span className="text-[10px] text-white/30">{leg.label}</span>
-                </div>
-              ))}
-            </div>
-          </div>
-        </div>
-      </Card>
+      {/* ── Heatmap novo ── */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        <HeatmapCard heatmapData={heatmapData} freqPorHora={freqPorHora} />
+      </div>
 
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
 
