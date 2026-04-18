@@ -21,7 +21,7 @@ const app = express()
 const server = createServer(app)
 let serverStarted = false
 
-app.use(cors({ origin: ['http://localhost:5173', 'http://localhost:3000'] }))
+app.use(cors({ origin: ['http://localhost:5173', 'http://localhost:3000', 'http://localhost:8080'] }))
 app.use(express.json())
 app.use('/api/v1', apiRouter)
 
@@ -62,12 +62,10 @@ async function initialize() {
       serverStarted = true
     }
 
-    // Resolve user_id pelo email uma única vez
     await initBotUser()
 
     await startCapture()
 
-    // Watchdog: reinicia se ficar mais de 5min sem velas
     cron.schedule('*/2 * * * *', async () => {
       const lastCandle = candleService.getLastCandle()
       if (lastCandle) {
@@ -96,12 +94,10 @@ async function startCapture() {
     const page = await launchBrowser()
     status.connected = true
 
-    // ⚠️ Login DEVE terminar completamente antes de qualquer outra ação
     const loggedIn = await login(page)
     if (!loggedIn) throw new Error('Login falhou')
     status.loggedIn = true
 
-    // Só navega para o jogo após login confirmado
     await navigateToAviator(page)
     status.gameOpen = true
 

@@ -1,13 +1,32 @@
+// src/server/api.ts
 import express from 'express'
 import { candleService } from '../services/candleService.js'
 import { getRawFrames } from '../browser/interceptor.js'
 import { getStatus } from '../index.js'
+import {
+  alertStrategySignal,
+  alertMarketPaying,
+  alertWarning,
+  alertConfirmed,
+  alertResult,
+  testConnection,
+  isConfigured,
+  getPayThreshold,
+  setSavedTargets,
+  getSavedTargets,
+  startConnection,
+  disconnect,
+  getConnState,
+  getQrBase64,
+  getGroups,
+  getContacts,
+} from '../services/whatsappService.js'
 
 const router = express.Router()
 
-router.get('/status', (req, res) => {
-  res.json(getStatus())
-})
+// ── Candles ────────────────────────────────────────────────────────────────────
+
+router.get('/status', (_req, res) => res.json(getStatus()))
 
 router.get('/candles', (req, res) => {
   const limit = Math.min(parseInt(req.query.limit as string) || 100, 1000)
@@ -15,32 +34,212 @@ router.get('/candles', (req, res) => {
   res.json({ candles, total: candles.length })
 })
 
-router.get('/candles/stats', (req, res) => {
-  res.json(candleService.getStats())
-})
-
-router.get('/candles/last', (req, res) => {
-  res.json(candleService.getLastCandle())
-})
+router.get('/candles/stats', (_req, res) => res.json(candleService.getStats()))
+router.get('/candles/last',  (_req, res) => res.json(candleService.getLastCandle()))
 
 router.post('/candles/manual', (req, res) => {
   const { multiplicador } = req.body
   if (!multiplicador || isNaN(multiplicador)) {
-    res.status(400).json({ error: 'Multiplicador inválido' })
-    return
+    res.status(400).json({ error: 'Multiplicador inválido' }); return
   }
-  const candle = candleService.addCandle(parseFloat(multiplicador), `manual_${Date.now()}`)
-  res.json(candle)
+  res.json(candleService.addCandle(parseFloat(multiplicador), `manual_${Date.now()}`))
 })
 
-router.delete('/candles', (req, res) => {
+router.delete('/candles', (_req, res) => {
   candleService.clear()
   res.json({ message: 'Buffer limpo' })
 })
 
 router.get('/debug/frames', (req, res) => {
-  const limit = parseInt(req.query.limit as string) || 20
-  res.json(getRawFrames().slice(0, limit))
+  res.json(getRawFrames().slice(0, parseInt(req.query.limit as string) || 20))
+})
+
+// ── WhatsApp — config & sinal ──────────────────────────────────────────────────
+
+router.get('/whatsapp/status', (_req, res) => {
+  res.json({
+    configured:   isConfigured(),
+    provider:     'baileys',
+    payThreshold: getPayThreshold(),
+    targets:      getSavedTargets(),
+  })
+})
+
+router.post('/whatsapp/test', async (_req, res) => {
+  const result = await testConnection()
+  result.ok
+    ? res.json({ ok: true, message: 'Mensagem de teste enviada com sucesso!' })
+    : res.status(400).json({ ok: false, error: result.error })
+})
+
+router.post('/whatsapp/signal', async (req, res) => {
+  const { strategyName, signalMsg, targets } = req.body
+  if (!strategyName || !signalMsg) {
+    res.status(400).json({ error: 'strategyName e signalMsg são obrigatórios' }); return
+  }
+  if (!isConfigured()) {
+    res.status(503).json({ error: 'WhatsApp não conectado' }); return
+  }
+  try {
+    await alertStrategySignal(strategyName, signalMsg, targets)
+    res.json({ ok: true })
+  } catch (err: any) {
+    res.status(500).json({ ok: false, error: err.message })
+  }
+})
+
+// ── WhatsApp — Targets ────────────────────────────────────────────────────────
+
+router.get('/whatsapp/targets', (_req, res) => {
+  res.json({ targets: getSavedTargets() })
+})
+
+router.post('/whatsapp/targets', (req, res) => {
+  const { targets } = req.body
+  if (!Array.isArray(targets)) {
+    res.status(400).json({ error: 'targets deve ser um array' }); return
+  }
+  setSavedTargets(targets)
+  res.json({ ok: true, count: targets.length })
+})
+
+// ── WhatsApp — Instância & QR (Baileys) ───────────────────────────────────────
+
+/**
+ * GET /api/v1/whatsapp/instance/state
+ * Retorna: { state: 'open' | 'connecting' | 'close' | 'error' }
+ */
+router.get('/whatsapp/instance/state', (_req, res) => {
+  res.json({ state: getConnState() })
+})
+
+/**
+ * POST /api/v1/whatsapp/instance/connect
+ * Inicia socket Baileys. Retorna QR base64 ou { state: 'open' } se já conectado.
+ */
+router.post('/whatsapp/instance/connect', async (_req, res) => {
+  const current = getConnState()
+
+  if (current === 'open') {
+    res.json({ state: 'open', qr: null }); return
+  }
+
+  if (current === 'connecting') {
+    res.json({ state: 'connecting', qr: getQrBase64() }); return
+  }
+
+  // Inicia em background — não bloqueia o HTTP
+  startConnection().catch(() => {})
+
+  // Aguarda até 8s para QR aparecer ou conexão abrir
+  let waited = 0
+  while (waited < 8000) {
+    await new Promise(r => setTimeout(r, 300))
+    waited += 300
+    const s = getConnState()
+    if (s === 'open')  { res.json({ state: 'open', qr: null }); return }
+    if (getQrBase64()) { res.json({ state: 'connecting', qr: getQrBase64() }); return }
+  }
+
+  res.json({ state: getConnState(), qr: getQrBase64() })
+})
+
+/**
+ * POST /api/v1/whatsapp/instance/disconnect
+ * Desconecta e apaga sessão local.
+ */
+router.post('/whatsapp/instance/disconnect', async (_req, res) => {
+  try {
+    await disconnect()
+    res.json({ ok: true })
+  } catch (err: any) {
+    res.status(500).json({ ok: false, error: err.message })
+  }
+})
+
+// ── WhatsApp — Grupos & Contatos ───────────────────────────────────────────────
+
+/**
+ * GET /api/v1/whatsapp/groups
+ */
+router.get('/whatsapp/groups', (_req, res) => {
+  res.json({ groups: getGroups() })
+})
+
+/**
+ * GET /api/v1/whatsapp/contacts
+ * Baileys não expõe lista de contatos diretamente.
+ * Retorna o que foi populado via mensagens recebidas.
+ */
+router.get('/whatsapp/contacts', (_req, res) => {
+  res.json({ contacts: getContacts() })
+})
+
+// ── WhatsApp — Alertas de Mercado & Trade ─────────────────────────────────────
+
+/**
+ * POST /api/v1/whatsapp/market-paying
+ * Alerta de mercado favorável (cooldown 10min no service)
+ */
+router.post('/whatsapp/market-paying', async (req, res) => {
+  const { bluePercent, targets } = req.body
+  if (!isConfigured()) { res.status(503).json({ error: 'WhatsApp não conectado' }); return }
+  try {
+    await alertMarketPaying(bluePercent ?? 0, targets)
+    res.json({ ok: true })
+  } catch (err: any) {
+    res.status(500).json({ ok: false, error: err.message })
+  }
+})
+
+/**
+ * POST /api/v1/whatsapp/warning
+ * Pré-sinal — 1 vela antes da entrada
+ */
+router.post('/whatsapp/warning', async (req, res) => {
+  const { strategyName, targets } = req.body
+  if (!strategyName) { res.status(400).json({ error: 'strategyName obrigatório' }); return }
+  if (!isConfigured()) { res.status(503).json({ error: 'WhatsApp não conectado' }); return }
+  try {
+    await alertWarning(strategyName, targets)
+    res.json({ ok: true })
+  } catch (err: any) {
+    res.status(500).json({ ok: false, error: err.message })
+  }
+})
+
+/**
+ * POST /api/v1/whatsapp/confirmed
+ * Entrada confirmada
+ */
+router.post('/whatsapp/confirmed', async (req, res) => {
+  const { strategyName, targets } = req.body
+  if (!strategyName) { res.status(400).json({ error: 'strategyName obrigatório' }); return }
+  if (!isConfigured()) { res.status(503).json({ error: 'WhatsApp não conectado' }); return }
+  try {
+    await alertConfirmed(strategyName, targets)
+    res.json({ ok: true })
+  } catch (err: any) {
+    res.status(500).json({ ok: false, error: err.message })
+  }
+})
+
+/**
+ * POST /api/v1/whatsapp/result
+ * Resultado do trade: win_g1 | win_g2 | loss
+ */
+router.post('/whatsapp/result', async (req, res) => {
+  const { strategyName, result, multiplier, targets } = req.body
+  if (!strategyName || !result || multiplier === undefined) {
+    res.status(400).json({ error: 'strategyName, result e multiplier são obrigatórios' }); return
+  }
+  if (!isConfigured()) { res.status(503).json({ error: 'WhatsApp não conectado' }); return }
+  try {
+    await alertResult(strategyName, result, multiplier, targets)
+    res.json({ ok: true })
+  } catch (err: any) {
+    res.status(500).json({ ok: false, error: err.message })
+  }
 })
 
 export default router

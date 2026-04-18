@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  evolution-api:
+    image: atendai/evolution-api:latest
+    container_name: evolution-api
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      # ── API Key global — use o mesmo valor em WPP_TOKEN no .env do bot ──────
+      AUTHENTICATION_TYPE: apikey
+      AUTHENTICATION_API_KEY: aviator123
+
+      # ── Armazenamento local (sem Redis/MongoDB necessário) ───────────────────
+      DATABASE_PROVIDER: sqlite
+
+      # ── QR Code via terminal (para parear o WhatsApp) ────────────────────────
+      QRCODE_LIMIT: 10
+      QRCODE_COLOR: "#00a884"
+
+      # ── Logs ─────────────────────────────────────────────────────────────────
+      LOG_LEVEL: ERROR
+      LOG_COLOR: "true"
+
+    volumes:
+      - evolution_data:/evolution/instances
+      - evolution_store:/evolution/store
+
+volumes:
+  evolution_data:
+  evolution_store:
