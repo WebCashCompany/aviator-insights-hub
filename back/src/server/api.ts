@@ -8,6 +8,7 @@ import {
   alertMarketPaying,
   alertWarning,
   alertConfirmed,
+  alertGale,
   alertResult,
   testConnection,
   isConfigured,
@@ -105,33 +106,22 @@ router.post('/whatsapp/targets', (req, res) => {
 
 // ── WhatsApp — Instância & QR (Baileys) ───────────────────────────────────────
 
-/**
- * GET /api/v1/whatsapp/instance/state
- * Retorna: { state: 'open' | 'connecting' | 'close' | 'error' }
- */
 router.get('/whatsapp/instance/state', (_req, res) => {
   res.json({ state: getConnState() })
 })
 
-/**
- * POST /api/v1/whatsapp/instance/connect
- * Inicia socket Baileys. Retorna QR base64 ou { state: 'open' } se já conectado.
- */
 router.post('/whatsapp/instance/connect', async (_req, res) => {
   const current = getConnState()
 
   if (current === 'open') {
     res.json({ state: 'open', qr: null }); return
   }
-
   if (current === 'connecting') {
     res.json({ state: 'connecting', qr: getQrBase64() }); return
   }
 
-  // Inicia em background — não bloqueia o HTTP
   startConnection().catch(() => {})
 
-  // Aguarda até 8s para QR aparecer ou conexão abrir
   let waited = 0
   while (waited < 8000) {
     await new Promise(r => setTimeout(r, 300))
@@ -144,10 +134,6 @@ router.post('/whatsapp/instance/connect', async (_req, res) => {
   res.json({ state: getConnState(), qr: getQrBase64() })
 })
 
-/**
- * POST /api/v1/whatsapp/instance/disconnect
- * Desconecta e apaga sessão local.
- */
 router.post('/whatsapp/instance/disconnect', async (_req, res) => {
   try {
     await disconnect()
@@ -159,18 +145,10 @@ router.post('/whatsapp/instance/disconnect', async (_req, res) => {
 
 // ── WhatsApp — Grupos & Contatos ───────────────────────────────────────────────
 
-/**
- * GET /api/v1/whatsapp/groups
- */
 router.get('/whatsapp/groups', (_req, res) => {
   res.json({ groups: getGroups() })
 })
 
-/**
- * GET /api/v1/whatsapp/contacts
- * Baileys não expõe lista de contatos diretamente.
- * Retorna o que foi populado via mensagens recebidas.
- */
 router.get('/whatsapp/contacts', (_req, res) => {
   res.json({ contacts: getContacts() })
 })
@@ -179,13 +157,14 @@ router.get('/whatsapp/contacts', (_req, res) => {
 
 /**
  * POST /api/v1/whatsapp/market-paying
- * Alerta de mercado favorável (cooldown 10min no service)
+ * Alerta de mercado favorável — sem parâmetro bluePercent,
+ * a mensagem mostra qualidades positivas do gráfico.
  */
 router.post('/whatsapp/market-paying', async (req, res) => {
-  const { bluePercent, targets } = req.body
+  const { targets } = req.body
   if (!isConfigured()) { res.status(503).json({ error: 'WhatsApp não conectado' }); return }
   try {
-    await alertMarketPaying(bluePercent ?? 0, targets)
+    await alertMarketPaying(targets)
     res.json({ ok: true })
   } catch (err: any) {
     res.status(500).json({ ok: false, error: err.message })
@@ -210,7 +189,7 @@ router.post('/whatsapp/warning', async (req, res) => {
 
 /**
  * POST /api/v1/whatsapp/confirmed
- * Entrada confirmada
+ * Entrada confirmada — hora de entrar
  */
 router.post('/whatsapp/confirmed', async (req, res) => {
   const { strategyName, targets } = req.body
@@ -218,6 +197,22 @@ router.post('/whatsapp/confirmed', async (req, res) => {
   if (!isConfigured()) { res.status(503).json({ error: 'WhatsApp não conectado' }); return }
   try {
     await alertConfirmed(strategyName, targets)
+    res.json({ ok: true })
+  } catch (err: any) {
+    res.status(500).json({ ok: false, error: err.message })
+  }
+})
+
+/**
+ * POST /api/v1/whatsapp/gale
+ * G1 perdeu — entre no Martingale (dobro da entrada)
+ */
+router.post('/whatsapp/gale', async (req, res) => {
+  const { strategyName, targets } = req.body
+  if (!strategyName) { res.status(400).json({ error: 'strategyName obrigatório' }); return }
+  if (!isConfigured()) { res.status(503).json({ error: 'WhatsApp não conectado' }); return }
+  try {
+    await alertGale(strategyName, targets)
     res.json({ ok: true })
   } catch (err: any) {
     res.status(500).json({ ok: false, error: err.message })
