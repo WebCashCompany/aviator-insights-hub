@@ -1,4 +1,4 @@
-import { useMemo } from 'react'
+import { useMemo, useRef, useState, useEffect, useCallback } from 'react'
 import { useCandles } from '@/hooks/useCandles'
 import { useWS } from '@/contexts/WebSocketContext'
 import { calcularStats } from '@/utils/candleUtils'
@@ -13,10 +13,9 @@ import {
   CartesianGrid, ReferenceLine, Legend,
 } from 'recharts'
 import { format, isValid, getHours } from 'date-fns'
-import { ptBR } from 'date-fns/locale'
 import { TrendingUp, Activity, Clock, Zap, Target, BarChart2 } from 'lucide-react'
 
-// ── Paleta ────────────────────────────────────────────────────────────────────
+// ── Paleta ─────────────────────────────────────────────────────────────────────
 const C = {
   blue:   'hsl(217,91%,60%)',
   purple: 'hsl(263,70%,58%)',
@@ -27,9 +26,39 @@ const C = {
 }
 
 const TOOLTIP_STYLE = {
-  contentStyle: { background: '#0d0d0f', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '10px', fontSize: 12 },
+  contentStyle: {
+    background: '#0d0d0f',
+    border: '1px solid rgba(255,255,255,0.1)',
+    borderRadius: '10px',
+    fontSize: 12,
+  },
   itemStyle: { color: '#fff' },
   labelStyle: { color: 'rgba(255,255,255,0.5)', fontSize: 11 },
+}
+
+// ── Hook: largura do container com debounce ────────────────────────────────────
+// Impede que cada pixel de animação do sidebar dispare re-render nos gráficos
+function useDebouncedWidth(ref: React.RefObject<HTMLDivElement>, delay = 120) {
+  const [width, setWidth] = useState(0)
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  useEffect(() => {
+    if (!ref.current) return
+    const obs = new ResizeObserver(([entry]) => {
+      const w = entry.contentRect.width
+      if (timer.current) clearTimeout(timer.current)
+      timer.current = setTimeout(() => setWidth(w), delay)
+    })
+    obs.observe(ref.current)
+    // Leitura inicial
+    setWidth(ref.current.getBoundingClientRect().width)
+    return () => {
+      obs.disconnect()
+      if (timer.current) clearTimeout(timer.current)
+    }
+  }, [ref, delay])
+
+  return width
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -65,9 +94,7 @@ function buildIntervalRosa(candles: any[]) {
 
 function buildHeatmapHora(candles: any[]) {
   const horas: Record<number, { blue: number; purple: number; pink: number; total: number }> = {}
-  for (let h = 0; h < 24; h++) {
-    horas[h] = { blue: 0, purple: 0, pink: 0, total: 0 }
-  }
+  for (let h = 0; h < 24; h++) horas[h] = { blue: 0, purple: 0, pink: 0, total: 0 }
   candles.forEach(c => {
     const d = new Date(c.created_at)
     if (!isValid(d)) return
@@ -110,7 +137,9 @@ function buildRunLength(candles: any[]) {
   const toFreq = (arr: number[]) => {
     const freq: Record<number, number> = {}
     arr.forEach(n => { freq[n] = (freq[n] || 0) + 1 })
-    return Object.entries(freq).map(([k, v]) => ({ tamanho: Number(k), frequencia: v })).sort((a, b) => a.tamanho - b.tamanho)
+    return Object.entries(freq)
+      .map(([k, v]) => ({ tamanho: Number(k), frequencia: v }))
+      .sort((a, b) => a.tamanho - b.tamanho)
   }
   return { blue: toFreq(runs.blue), purple: toFreq(runs.purple), pink: toFreq(runs.pink) }
 }
@@ -129,7 +158,7 @@ function buildRadar(candles: any[]) {
   ]
 }
 
-// ── Componente de Card de Gráfico ─────────────────────────────────────────────
+// ── Card de Gráfico ────────────────────────────────────────────────────────────
 function ChartCard({ title, subtitle, icon: Icon, children, span = 1 }: {
   title: string
   subtitle?: string
@@ -161,9 +190,13 @@ const CustomDot = (props: any) => {
   return <circle cx={cx} cy={cy} r={3} fill={corColor(payload.cor)} fillOpacity={0.8} stroke="none" />
 }
 
-// ── Página Principal ──────────────────────────────────────────────────────────
+// ── Página Principal ───────────────────────────────────────────────────────────
 export default function ChartsPage() {
   const ws = useWS()
+  const containerRef = useRef<HTMLDivElement>(null)
+
+  // Largura debounced — só re-renderiza gráficos após sidebar terminar animação
+  const containerWidth = useDebouncedWidth(containerRef as React.RefObject<HTMLDivElement>, 120)
 
   const { candles: dbCandles } = useCandles({ limit: 500 })
 
@@ -232,8 +265,14 @@ export default function ChartsPage() {
     )
   }
 
+  // Dimensões derivadas da largura debounced — evita ResponsiveContainer
+  // recalculando a cada frame durante a animação do sidebar
+  const isWide      = containerWidth > 768
+  const colWidth    = isWide ? (containerWidth - 48) / 2 : containerWidth - 32
+  const fullWidth   = containerWidth - 32
+
   return (
-    <div className="p-4 pb-24 lg:pb-6 space-y-4">
+    <div ref={containerRef} className="p-4 pb-24 lg:pb-6 space-y-4">
       <div className="flex items-center justify-between mb-2">
         <div>
           <h1 className="text-lg font-bold text-white">Análise Gráfica</h1>
@@ -252,6 +291,7 @@ export default function ChartsPage() {
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
 
+        {/* ── Multiplicadores ao longo do tempo ── */}
         <ChartCard
           title="Multiplicadores ao Longo do Tempo"
           subtitle={`Média móvel 10 períodos · pico ${stats?.maior?.toFixed(2)}x`}
@@ -259,67 +299,82 @@ export default function ChartsPage() {
           span={2}
         >
           <div className="h-[220px]">
-            <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={mediaMovel} margin={{ left: -20, right: 4 }}>
-                <defs>
-                  <linearGradient id="gMult" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%"  stopColor={C.blue} stopOpacity={0.25}/>
-                    <stop offset="95%" stopColor={C.blue} stopOpacity={0}/>
-                  </linearGradient>
-                </defs>
-                <CartesianGrid stroke={C.grid} vertical={false} />
-                <XAxis dataKey="i" hide />
-                <YAxis stroke={C.axis} fontSize={10} tickFormatter={v => `${v}x`} />
-                <Tooltip {...TOOLTIP_STYLE} formatter={(v: any) => [`${Number(v).toFixed(2)}x`]} />
-                <ReferenceLine y={2}  stroke={C.purple} strokeDasharray="3 3" strokeOpacity={0.5} />
-                <ReferenceLine y={10} stroke={C.pink}   strokeDasharray="3 3" strokeOpacity={0.5} />
-                <Area dataKey="v"  stroke={C.blue} fill="url(#gMult)" strokeWidth={1.5} dot={false} name="Multiplicador" />
-                <Line dataKey="ma" stroke={C.pink} strokeWidth={2}    dot={false} strokeDasharray="4 2" name="Média 10p" connectNulls />
-              </AreaChart>
-            </ResponsiveContainer>
+            <AreaChart
+              width={fullWidth}
+              height={220}
+              data={mediaMovel}
+              margin={{ left: -20, right: 4 }}
+            >
+              <defs>
+                <linearGradient id="gMult" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="5%"  stopColor={C.blue} stopOpacity={0.25}/>
+                  <stop offset="95%" stopColor={C.blue} stopOpacity={0}/>
+                </linearGradient>
+              </defs>
+              <CartesianGrid stroke={C.grid} vertical={false} />
+              <XAxis dataKey="i" hide />
+              <YAxis stroke={C.axis} fontSize={10} tickFormatter={v => `${v}x`} />
+              <Tooltip {...TOOLTIP_STYLE} formatter={(v: any) => [`${Number(v).toFixed(2)}x`]} />
+              <ReferenceLine y={2}  stroke={C.purple} strokeDasharray="3 3" strokeOpacity={0.5} />
+              <ReferenceLine y={10} stroke={C.pink}   strokeDasharray="3 3" strokeOpacity={0.5} />
+              <Area  dataKey="v"  stroke={C.blue} fill="url(#gMult)" strokeWidth={1.5} dot={false} name="Multiplicador" />
+              <Line  dataKey="ma" stroke={C.pink} strokeWidth={2}    dot={false} strokeDasharray="4 2" name="Média 10p" connectNulls />
+            </AreaChart>
           </div>
         </ChartCard>
 
+        {/* ── Distribuição por faixa ── */}
         <ChartCard
           title="Distribuição por Faixa"
           subtitle="Quantas velas caíram em cada faixa de multiplicador"
           icon={BarChart2}
         >
           <div className="h-[200px]">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={distData} margin={{ left: -20, right: 4 }}>
-                <CartesianGrid stroke={C.grid} vertical={false} />
-                <XAxis dataKey="label" stroke={C.axis} fontSize={10} />
-                <YAxis stroke={C.axis} fontSize={10} />
-                <Tooltip {...TOOLTIP_STYLE} formatter={(v: any) => [`${v} velas`]} />
-                <Bar dataKey="count" radius={[6,6,0,0]} name="Velas">
-                  {distData.map((d, i) => <Cell key={i} fill={corColor(d.cor)} fillOpacity={0.85} />)}
-                </Bar>
-              </BarChart>
-            </ResponsiveContainer>
+            <BarChart width={colWidth} height={200} data={distData} margin={{ left: -20, right: 4 }}>
+              <CartesianGrid stroke={C.grid} vertical={false} />
+              <XAxis dataKey="label" stroke={C.axis} fontSize={10} />
+              <YAxis stroke={C.axis} fontSize={10} />
+              <Tooltip {...TOOLTIP_STYLE} formatter={(v: any) => [`${v} velas`]} />
+              <Bar dataKey="count" radius={[6,6,0,0]} name="Velas">
+                {distData.map((d, i) => <Cell key={i} fill={corColor(d.cor)} fillOpacity={0.85} />)}
+              </Bar>
+            </BarChart>
           </div>
         </ChartCard>
 
+        {/* ── Streak history ── */}
         <ChartCard
           title="Comprimento de Streak por Vela"
           subtitle="Tamanho da sequência consecutiva em cada ponto"
           icon={Activity}
         >
           <div className="h-[200px]">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={streakHistory.slice(-80)} margin={{ left: -20, right: 4 }}>
-                <CartesianGrid stroke={C.grid} vertical={false} />
-                <XAxis dataKey="index" hide />
-                <YAxis stroke={C.axis} fontSize={10} allowDecimals={false} />
-                <Tooltip {...TOOLTIP_STYLE} formatter={(v: any, _: any, p: any) => [`${v} seguidas`, p.payload.cor === 'blue' ? 'Azul' : p.payload.cor === 'purple' ? 'Roxa' : 'Rosa']} />
-                <Bar dataKey="streak" radius={[3,3,0,0]} name="Streak">
-                  {streakHistory.slice(-80).map((d, i) => <Cell key={i} fill={corColor(d.cor)} fillOpacity={0.8} />)}
-                </Bar>
-              </BarChart>
-            </ResponsiveContainer>
+            <BarChart
+              width={colWidth}
+              height={200}
+              data={streakHistory.slice(-80)}
+              margin={{ left: -20, right: 4 }}
+            >
+              <CartesianGrid stroke={C.grid} vertical={false} />
+              <XAxis dataKey="index" hide />
+              <YAxis stroke={C.axis} fontSize={10} allowDecimals={false} />
+              <Tooltip
+                {...TOOLTIP_STYLE}
+                formatter={(v: any, _: any, p: any) => [
+                  `${v} seguidas`,
+                  p.payload.cor === 'blue' ? 'Azul' : p.payload.cor === 'purple' ? 'Roxa' : 'Rosa',
+                ]}
+              />
+              <Bar dataKey="streak" radius={[3,3,0,0]} name="Streak">
+                {streakHistory.slice(-80).map((d, i) => (
+                  <Cell key={i} fill={corColor(d.cor)} fillOpacity={0.8} />
+                ))}
+              </Bar>
+            </BarChart>
           </div>
         </ChartCard>
 
+        {/* ── Intervalo entre Rosas ── */}
         <ChartCard
           title="Intervalo Entre Rosas (10x+)"
           subtitle="Quantas velas entre cada aparição Rosa"
@@ -331,23 +386,39 @@ export default function ChartsPage() {
             </div>
           ) : (
             <div className="h-[200px]">
-              <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={intervalRosa} margin={{ left: -20, right: 4 }}>
-                  <CartesianGrid stroke={C.grid} vertical={false} />
-                  <XAxis dataKey="ocorrencia" stroke={C.axis} fontSize={10} tickFormatter={v => `#${v}`} />
-                  <YAxis stroke={C.axis} fontSize={10} label={{ value: 'velas', angle: -90, position: 'insideLeft', fill: C.axis, fontSize: 9, dx: 20 }} />
-                  <Tooltip {...TOOLTIP_STYLE} formatter={(v: any, n: any, p: any) => [`${v} velas · ${p.payload.mult}x`, 'Intervalo']} />
-                  <ReferenceLine
-                    y={intervalRosa.reduce((s, d) => s + d.intervalo, 0) / intervalRosa.length}
-                    stroke={C.purple} strokeDasharray="4 2" label={{ value: 'média', fill: C.purple, fontSize: 9 }}
-                  />
-                  <Bar dataKey="intervalo" fill={C.pink} fillOpacity={0.7} radius={[4,4,0,0]} name="Intervalo" />
-                </BarChart>
-              </ResponsiveContainer>
+              <BarChart
+                width={colWidth}
+                height={200}
+                data={intervalRosa}
+                margin={{ left: -20, right: 4 }}
+              >
+                <CartesianGrid stroke={C.grid} vertical={false} />
+                <XAxis dataKey="ocorrencia" stroke={C.axis} fontSize={10} tickFormatter={v => `#${v}`} />
+                <YAxis
+                  stroke={C.axis}
+                  fontSize={10}
+                  label={{ value: 'velas', angle: -90, position: 'insideLeft', fill: C.axis, fontSize: 9, dx: 20 }}
+                />
+                <Tooltip
+                  {...TOOLTIP_STYLE}
+                  formatter={(v: any, n: any, p: any) => [
+                    `${v} velas · ${p.payload.mult}x`,
+                    'Intervalo',
+                  ]}
+                />
+                <ReferenceLine
+                  y={intervalRosa.reduce((s, d) => s + d.intervalo, 0) / intervalRosa.length}
+                  stroke={C.purple}
+                  strokeDasharray="4 2"
+                  label={{ value: 'média', fill: C.purple, fontSize: 9 }}
+                />
+                <Bar dataKey="intervalo" fill={C.pink} fillOpacity={0.7} radius={[4,4,0,0]} name="Intervalo" />
+              </BarChart>
             </div>
           )}
         </ChartCard>
 
+        {/* ── % Rosa por horário ── */}
         <ChartCard
           title="% Rosa por Horário"
           subtitle="Em quais horas Rosa (10x+) aparece mais"
@@ -360,38 +431,42 @@ export default function ChartsPage() {
             </div>
           ) : (
             <div className="h-[180px]">
-              <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={heatmap} margin={{ left: -20, right: 4 }}>
-                  <CartesianGrid stroke={C.grid} vertical={false} />
-                  <XAxis dataKey="hora" stroke={C.axis} fontSize={10} />
-                  <YAxis stroke={C.axis} fontSize={10} tickFormatter={v => `${v}%`} />
-                  <Tooltip
-                    {...TOOLTIP_STYLE}
-                    content={({ active, payload }) => {
-                      if (!active || !payload?.length) return null
-                      const d = payload[0].payload
-                      return (
-                        <div style={TOOLTIP_STYLE.contentStyle} className="p-3 space-y-1">
-                          <p className="font-bold text-white">{d.hora}</p>
-                          <p style={{ color: C.blue   }}>Azul: {d.azul}</p>
-                          <p style={{ color: C.purple }}>Roxa: {d.roxa}</p>
-                          <p style={{ color: C.pink   }}>Rosa: {d.rosa} ({d.pctRosa}%)</p>
-                          <p className="text-white/40">Total: {d.total}</p>
-                        </div>
-                      )
-                    }}
-                  />
-                  <Bar dataKey="pctRosa" radius={[4,4,0,0]} name="% Rosa">
-                    {heatmap.map((d, i) => (
-                      <Cell key={i} fill={C.pink} fillOpacity={0.15 + (d.pctRosa / 100) * 0.85} />
-                    ))}
-                  </Bar>
-                </BarChart>
-              </ResponsiveContainer>
+              <BarChart
+                width={fullWidth}
+                height={180}
+                data={heatmap}
+                margin={{ left: -20, right: 4 }}
+              >
+                <CartesianGrid stroke={C.grid} vertical={false} />
+                <XAxis dataKey="hora" stroke={C.axis} fontSize={10} />
+                <YAxis stroke={C.axis} fontSize={10} tickFormatter={v => `${v}%`} />
+                <Tooltip
+                  {...TOOLTIP_STYLE}
+                  content={({ active, payload }) => {
+                    if (!active || !payload?.length) return null
+                    const d = payload[0].payload
+                    return (
+                      <div style={TOOLTIP_STYLE.contentStyle} className="p-3 space-y-1">
+                        <p className="font-bold text-white">{d.hora}</p>
+                        <p style={{ color: C.blue   }}>Azul: {d.azul}</p>
+                        <p style={{ color: C.purple }}>Roxa: {d.roxa}</p>
+                        <p style={{ color: C.pink   }}>Rosa: {d.rosa} ({d.pctRosa}%)</p>
+                        <p className="text-white/40">Total: {d.total}</p>
+                      </div>
+                    )
+                  }}
+                />
+                <Bar dataKey="pctRosa" radius={[4,4,0,0]} name="% Rosa">
+                  {heatmap.map((d, i) => (
+                    <Cell key={i} fill={C.pink} fillOpacity={0.15 + (d.pctRosa / 100) * 0.85} />
+                  ))}
+                </Bar>
+              </BarChart>
             </div>
           )}
         </ChartCard>
 
+        {/* ── Correlação ── */}
         <ChartCard
           title="Correlação: Vela Anterior × Atual"
           subtitle="Cada ponto é uma vela. Padrões indicam dependência entre rodadas"
@@ -399,48 +474,64 @@ export default function ChartsPage() {
           span={2}
         >
           <div className="h-[260px]">
-            <ResponsiveContainer width="100%" height="100%">
-              <ScatterChart margin={{ left: -10, right: 10 }}>
-                <CartesianGrid stroke={C.grid} />
-                <XAxis dataKey="anterior" name="Anterior" stroke={C.axis} fontSize={10}
-                  tickFormatter={v => `${v}x`} domain={[0, 'auto']}
-                  label={{ value: 'Vela anterior (x)', position: 'insideBottom', offset: -2, fill: C.axis, fontSize: 10 }}
+            <ScatterChart
+              width={fullWidth}
+              height={260}
+              margin={{ left: -10, right: 10 }}
+            >
+              <CartesianGrid stroke={C.grid} />
+              <XAxis
+                dataKey="anterior"
+                name="Anterior"
+                stroke={C.axis}
+                fontSize={10}
+                tickFormatter={v => `${v}x`}
+                domain={[0, 'auto']}
+                label={{ value: 'Vela anterior (x)', position: 'insideBottom', offset: -2, fill: C.axis, fontSize: 10 }}
+              />
+              <YAxis
+                dataKey="atual"
+                name="Atual"
+                stroke={C.axis}
+                fontSize={10}
+                tickFormatter={v => `${v}x`}
+                label={{ value: 'Vela atual (x)', angle: -90, position: 'insideLeft', fill: C.axis, fontSize: 10, dx: 20 }}
+              />
+              <ZAxis range={[18, 18]} />
+              <Tooltip
+                {...TOOLTIP_STYLE}
+                cursor={{ strokeDasharray: '3 3', stroke: 'rgba(255,255,255,0.1)' }}
+                content={({ active, payload }) => {
+                  if (!active || !payload?.length) return null
+                  const d = payload[0].payload
+                  return (
+                    <div style={TOOLTIP_STYLE.contentStyle} className="p-2 text-xs">
+                      <p style={{ color: corColor(d.cor) }}>Anterior: {d.anterior.toFixed(2)}x</p>
+                      <p style={{ color: corColor(d.cor) }}>Atual: {d.atual.toFixed(2)}x</p>
+                    </div>
+                  )
+                }}
+              />
+              {(['blue', 'purple', 'pink'] as const).map(cor => (
+                <Scatter
+                  key={cor}
+                  data={correlacao.filter(d => d.cor === cor).slice(-150)}
+                  fill={corColor(cor)}
+                  fillOpacity={0.55}
+                  name={cor === 'blue' ? 'Azul' : cor === 'purple' ? 'Roxa' : 'Rosa'}
+                  shape={<CustomDot />}
                 />
-                <YAxis dataKey="atual" name="Atual" stroke={C.axis} fontSize={10}
-                  tickFormatter={v => `${v}x`}
-                  label={{ value: 'Vela atual (x)', angle: -90, position: 'insideLeft', fill: C.axis, fontSize: 10, dx: 20 }}
-                />
-                <ZAxis range={[18, 18]} />
-                <Tooltip
-                  {...TOOLTIP_STYLE}
-                  cursor={{ strokeDasharray: '3 3', stroke: 'rgba(255,255,255,0.1)' }}
-                  content={({ active, payload }) => {
-                    if (!active || !payload?.length) return null
-                    const d = payload[0].payload
-                    return (
-                      <div style={TOOLTIP_STYLE.contentStyle} className="p-2 text-xs">
-                        <p style={{ color: corColor(d.cor) }}>Anterior: {d.anterior.toFixed(2)}x</p>
-                        <p style={{ color: corColor(d.cor) }}>Atual: {d.atual.toFixed(2)}x</p>
-                      </div>
-                    )
-                  }}
-                />
-                {(['blue', 'purple', 'pink'] as const).map(cor => (
-                  <Scatter
-                    key={cor}
-                    data={correlacao.filter(d => d.cor === cor).slice(-150)}
-                    fill={corColor(cor)}
-                    fillOpacity={0.55}
-                    name={cor === 'blue' ? 'Azul' : cor === 'purple' ? 'Roxa' : 'Rosa'}
-                    shape={<CustomDot />}
-                  />
-                ))}
-                <Legend formatter={(v) => <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.5)' }}>{v}</span>} />
-              </ScatterChart>
-            </ResponsiveContainer>
+              ))}
+              <Legend
+                formatter={v => (
+                  <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.5)' }}>{v}</span>
+                )}
+              />
+            </ScatterChart>
           </div>
         </ChartCard>
 
+        {/* ── Distribuição de sequências ── */}
         <ChartCard
           title="Distribuição de Sequências por Cor"
           subtitle="Com que frequência cada cor forma sequências de N rodadas"
@@ -454,39 +545,61 @@ export default function ChartsPage() {
               { cor: 'pink',   label: 'Rosa',  data: runLength.pink },
             ] as const).map(({ cor, label, data }) => (
               <div key={cor}>
-                <p className="text-[11px] font-semibold mb-2" style={{ color: corColor(cor) }}>{label}</p>
+                <p className="text-[11px] font-semibold mb-2" style={{ color: corColor(cor) }}>
+                  {label}
+                </p>
                 <div className="h-[160px]">
-                  <ResponsiveContainer width="100%" height="100%">
-                    <BarChart data={data} margin={{ left: -28, right: 4 }}>
-                      <CartesianGrid stroke={C.grid} vertical={false} />
-                      <XAxis dataKey="tamanho" stroke={C.axis} fontSize={9} tickFormatter={v => `${v}x`} />
-                      <YAxis stroke={C.axis} fontSize={9} />
-                      <Tooltip {...TOOLTIP_STYLE} formatter={(v: any, _, p) => [`${v}×`, `Seq. ${p.payload.tamanho} seguidas`]} />
-                      <Bar dataKey="frequencia" fill={corColor(cor)} fillOpacity={0.75} radius={[3,3,0,0]} />
-                    </BarChart>
-                  </ResponsiveContainer>
+                  <BarChart
+                    width={Math.floor((fullWidth - 24) / 3)}
+                    height={160}
+                    data={data}
+                    margin={{ left: -28, right: 4 }}
+                  >
+                    <CartesianGrid stroke={C.grid} vertical={false} />
+                    <XAxis dataKey="tamanho" stroke={C.axis} fontSize={9} tickFormatter={v => `${v}x`} />
+                    <YAxis stroke={C.axis} fontSize={9} />
+                    <Tooltip
+                      {...TOOLTIP_STYLE}
+                      formatter={(v: any, _, p) => [`${v}×`, `Seq. ${p.payload.tamanho} seguidas`]}
+                    />
+                    <Bar dataKey="frequencia" fill={corColor(cor)} fillOpacity={0.75} radius={[3,3,0,0]} />
+                  </BarChart>
                 </div>
               </div>
             ))}
           </div>
         </ChartCard>
 
+        {/* ── Radar ── */}
         <ChartCard
           title="Perfil da Sessão"
           subtitle="Visão radar das métricas relativas da sessão atual"
           icon={Activity}
         >
           <div className="h-[220px]">
-            <ResponsiveContainer width="100%" height="100%">
-              <RadarChart data={radarData} margin={{ top: 10, right: 20, bottom: 10, left: 20 }}>
-                <PolarGrid stroke={C.grid} />
-                <PolarAngleAxis dataKey="metrica" tick={{ fill: 'rgba(255,255,255,0.45)', fontSize: 10 }} />
-                <Radar dataKey="valor" stroke={C.blue} fill={C.blue} fillOpacity={0.15} strokeWidth={2} />
-              </RadarChart>
-            </ResponsiveContainer>
+            <RadarChart
+              width={colWidth}
+              height={220}
+              data={radarData}
+              margin={{ top: 10, right: 20, bottom: 10, left: 20 }}
+            >
+              <PolarGrid stroke={C.grid} />
+              <PolarAngleAxis
+                dataKey="metrica"
+                tick={{ fill: 'rgba(255,255,255,0.45)', fontSize: 10 }}
+              />
+              <Radar
+                dataKey="valor"
+                stroke={C.blue}
+                fill={C.blue}
+                fillOpacity={0.15}
+                strokeWidth={2}
+              />
+            </RadarChart>
           </div>
         </ChartCard>
 
+        {/* ── Volume por horário ── */}
         <ChartCard
           title="Volume por Horário (Azul / Roxa / Rosa)"
           subtitle="Composição de cores em cada hora do dia"
@@ -498,17 +611,20 @@ export default function ChartsPage() {
             </div>
           ) : (
             <div className="h-[220px]">
-              <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={heatmap} margin={{ left: -20, right: 4 }}>
-                  <CartesianGrid stroke={C.grid} vertical={false} />
-                  <XAxis dataKey="hora" stroke={C.axis} fontSize={10} />
-                  <YAxis stroke={C.axis} fontSize={10} />
-                  <Tooltip {...TOOLTIP_STYLE} />
-                  <Bar dataKey="azul"  stackId="a" fill={C.blue}   fillOpacity={0.8} name="Azul"  radius={[0,0,0,0]} />
-                  <Bar dataKey="roxa"  stackId="a" fill={C.purple} fillOpacity={0.8} name="Roxa" />
-                  <Bar dataKey="rosa"  stackId="a" fill={C.pink}   fillOpacity={0.8} name="Rosa"  radius={[4,4,0,0]} />
-                </BarChart>
-              </ResponsiveContainer>
+              <BarChart
+                width={colWidth}
+                height={220}
+                data={heatmap}
+                margin={{ left: -20, right: 4 }}
+              >
+                <CartesianGrid stroke={C.grid} vertical={false} />
+                <XAxis dataKey="hora" stroke={C.axis} fontSize={10} />
+                <YAxis stroke={C.axis} fontSize={10} />
+                <Tooltip {...TOOLTIP_STYLE} />
+                <Bar dataKey="azul" stackId="a" fill={C.blue}   fillOpacity={0.8} name="Azul"  radius={[0,0,0,0]} />
+                <Bar dataKey="roxa" stackId="a" fill={C.purple} fillOpacity={0.8} name="Roxa" />
+                <Bar dataKey="rosa" stackId="a" fill={C.pink}   fillOpacity={0.8} name="Rosa"  radius={[4,4,0,0]} />
+              </BarChart>
             </div>
           )}
         </ChartCard>
