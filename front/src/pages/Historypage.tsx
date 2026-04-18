@@ -1,46 +1,36 @@
 import { useState, useMemo, useEffect, useRef, useCallback } from 'react'
 import { useWS } from '@/contexts/WebSocketContext'
+import { useCandles } from '@/hooks/useCandles'
 import { Candle } from '@/types'
 import { calcularStats, detectarPadroes, corParaLabel } from '@/utils/candleUtils'
 
-// ─── Constantes ───────────────────────────────────────────────────────────────
-const MAX_HISTORY = 1000
 const INITIAL_LOAD = 60
 const LOAD_MORE = 60
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
 function formatHora(ts: string): string {
   return new Date(ts).toLocaleTimeString('pt-BR', {
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
   })
 }
 
-type Filtro = 'all' | 'blue' | 'purple' | 'pink'
+type Filtro    = 'all' | 'blue' | 'purple' | 'pink'
 type Ordenacao = 'recent' | 'asc' | 'desc'
-type TabView = 'grade' | 'lista'
+type TabView   = 'grade' | 'lista'
+type Limite    = 50 | 100 | 200 | 500 | 1000
 
-// ─── VelaCard ─────────────────────────────────────────────────────────────────
 function VelaCard({ candle, isNew }: { candle: Candle; isNew: boolean }) {
   const ts = candle.created_at || candle.timestamp
-
   const bgMap: Record<Candle['cor'], string> = {
     blue:   'bg-blue-500/10   border-blue-500/25   hover:border-blue-400/60',
     purple: 'bg-purple-500/10 border-purple-500/25 hover:border-purple-400/60',
     pink:   'bg-pink-500/10   border-pink-500/25   hover:border-pink-400/60',
   }
   const dotMap: Record<Candle['cor'], string> = {
-    blue:   'bg-blue-400',
-    purple: 'bg-purple-400',
-    pink:   'bg-pink-400',
+    blue: 'bg-blue-400', purple: 'bg-purple-400', pink: 'bg-pink-400',
   }
   const textMap: Record<Candle['cor'], string> = {
-    blue:   'text-blue-400',
-    purple: 'text-purple-400',
-    pink:   'text-pink-400',
+    blue: 'text-blue-400', purple: 'text-purple-400', pink: 'text-pink-400',
   }
-
   return (
     <div
       title={formatHora(ts)}
@@ -55,14 +45,11 @@ function VelaCard({ candle, isNew }: { candle: Candle; isNew: boolean }) {
       <span className={`text-[11px] font-medium leading-none ${textMap[candle.cor]}`}>
         {candle.multiplicador.toFixed(2)}x
       </span>
-      <span className="text-[9px] text-muted-foreground leading-none">
-        {formatHora(ts)}
-      </span>
+      <span className="text-[9px] text-muted-foreground leading-none">{formatHora(ts)}</span>
     </div>
   )
 }
 
-// ─── CorBadge ─────────────────────────────────────────────────────────────────
 function CorBadge({ cor }: { cor: Candle['cor'] }) {
   const map: Record<Candle['cor'], string> = {
     blue:   'bg-blue-500/10   text-blue-400   border-blue-500/30',
@@ -76,16 +63,36 @@ function CorBadge({ cor }: { cor: Candle['cor'] }) {
   )
 }
 
-// ─── Página ───────────────────────────────────────────────────────────────────
 export default function HistoryPage() {
   const { candles: wsCandles } = useWS()
 
-  // Mais recente primeiro (índice 0 = última vela)
+  // ── Filtro de quantidade (últimas N velas) ─────────────────────────────────
+  const [limite, setLimite] = useState<Limite>(1000)
+
+  // ── Busca tudo do banco; o corte acontece APÓS o merge com WS ─────────────
+  const { candles: dbCandles, loading } = useCandles({ limit: 5000 })
+
+  // ── Merge: banco + WebSocket, sem duplicatas ───────────────────────────────
   const candles = useMemo<Candle[]>(() => {
-    const all = [...wsCandles]
-    const sliced = all.length > MAX_HISTORY ? all.slice(all.length - MAX_HISTORY) : all
-    return sliced.reverse()
-  }, [wsCandles])
+    const wsArr = Array.isArray(wsCandles) ? wsCandles : []
+
+    const key = (c: any) => {
+      const bucket = Math.floor(new Date(c.created_at || c.timestamp).getTime() / 3000)
+      return `${Number(c.multiplicador).toFixed(2)}_${bucket}`
+    }
+
+    const map = new Map<string, Candle>()
+    for (const c of dbCandles) map.set(key(c), c as Candle)
+    for (const c of wsArr) { if (!map.has(key(c))) map.set(key(c), c) }
+
+    return Array.from(map.values())
+      .sort((a, b) => {
+        const ta = new Date((a.created_at || a.timestamp) as string).getTime()
+        const tb = new Date((b.created_at || b.timestamp) as string).getTime()
+        return tb - ta // mais recente primeiro
+      })
+      .slice(0, limite) // garante o limite após o merge com WS
+  }, [dbCandles, wsCandles, limite])
 
   const [filtro, setFiltro]       = useState<Filtro>('all')
   const [busca, setBusca]         = useState('')
@@ -97,7 +104,6 @@ export default function HistoryPage() {
   const loaderRef = useRef<HTMLDivElement>(null)
   const prevLen   = useRef(wsCandles.length)
 
-  // Animação de novas velas
   useEffect(() => {
     const curr = wsCandles.length
     if (curr > prevLen.current) {
@@ -111,29 +117,22 @@ export default function HistoryPage() {
     prevLen.current = curr
   }, [wsCandles])
 
-  // Reset visível ao mudar filtros
-  useEffect(() => { setVisivel(INITIAL_LOAD) }, [filtro, busca, ordenacao])
+  useEffect(() => { setVisivel(INITIAL_LOAD) }, [filtro, busca, ordenacao, limite])
 
-  // Filtro + ordenação
   const filtered = useMemo<Candle[]>(() => {
     let r = [...candles]
-
     if (filtro !== 'all') r = r.filter((c) => c.cor === filtro)
-
     if (busca) {
       const minVal = parseFloat(busca)
       if (!isNaN(minVal)) r = r.filter((c) => c.multiplicador >= minVal)
     }
-
     if (ordenacao === 'asc')  r.sort((a, b) => a.multiplicador - b.multiplicador)
     if (ordenacao === 'desc') r.sort((a, b) => b.multiplicador - a.multiplicador)
-
     return r
   }, [candles, filtro, busca, ordenacao])
 
   const visivelSlice = filtered.slice(0, visivel)
 
-  // Scroll infinito via IntersectionObserver
   const onIntersect = useCallback(
     (entries: IntersectionObserverEntry[]) => {
       if (entries[0].isIntersecting && visivel < filtered.length) {
@@ -151,7 +150,7 @@ export default function HistoryPage() {
     return () => obs.disconnect()
   }, [onIntersect])
 
-  // Stats sempre no array original (ordem cronológica)
+  // Para stats, precisamos da ordem cronológica (mais antiga primeiro)
   const candlesAsc = useMemo(() => [...candles].reverse(), [candles])
   const stats   = useMemo(() => (candlesAsc.length ? calcularStats(candlesAsc) : null), [candlesAsc])
   const padroes = useMemo(() => detectarPadroes(candlesAsc), [candlesAsc])
@@ -162,6 +161,16 @@ export default function HistoryPage() {
 
   const streakColor: Record<string, string> = {
     blue: 'text-blue-400', purple: 'text-purple-400', pink: 'text-pink-400',
+  }
+
+  // ── Loading state ──────────────────────────────────────────────────────────
+  if (loading) {
+    return (
+      <div className="flex flex-col items-center justify-center min-h-[60vh] gap-3 text-muted-foreground">
+        <p className="text-sm animate-pulse">Carregando histórico...</p>
+        <p className="text-xs opacity-60">Buscando velas do banco de dados</p>
+      </div>
+    )
   }
 
   if (!candles.length) {
@@ -175,6 +184,27 @@ export default function HistoryPage() {
 
   return (
     <div className="space-y-4 pb-6">
+
+      {/* ── Filtro de Quantidade ── */}
+      <div className="flex items-center gap-1.5">
+        <span className="text-xs text-muted-foreground mr-1">Últimas:</span>
+        {([50, 100, 200, 500, 1000] as Limite[]).map((n) => (
+          <button
+            key={n}
+            onClick={() => setLimite(n)}
+            className={`px-3 py-1 rounded-lg text-xs font-medium border transition-all ${
+              limite === n
+                ? 'bg-foreground text-background border-foreground'
+                : 'bg-muted/40 text-muted-foreground border-transparent hover:bg-card hover:text-foreground'
+            }`}
+          >
+            {n}
+          </button>
+        ))}
+        <span className="text-xs text-muted-foreground ml-auto">
+          {candles.length} velas no total
+        </span>
+      </div>
 
       {/* ── Cards de Resumo ── */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
@@ -280,7 +310,7 @@ export default function HistoryPage() {
       {/* ── Toolbar ── */}
       <div className="flex flex-wrap gap-2 items-center justify-between">
         <div className="flex flex-wrap gap-1.5 items-center">
-          {([ 'all', 'blue', 'purple', 'pink'] as Filtro[]).map((f) => {
+          {(['all', 'blue', 'purple', 'pink'] as Filtro[]).map((f) => {
             const isActive = filtro === f
             const base = 'px-3 py-1 rounded-lg text-xs font-medium border transition-all'
             const colorClass = isActive
@@ -332,15 +362,10 @@ export default function HistoryPage() {
               style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(64px, 1fr))' }}
             >
               {visivelSlice.map((candle) => (
-                <VelaCard
-                  key={candle.id}
-                  candle={candle}
-                  isNew={novosIds.has(candle.id)}
-                />
+                <VelaCard key={candle.id} candle={candle} isNew={novosIds.has(candle.id)} />
               ))}
             </div>
           )}
-
           {visivel < filtered.length && (
             <div ref={loaderRef} className="flex justify-center py-4">
               <span className="text-xs text-muted-foreground animate-pulse">
@@ -385,7 +410,6 @@ export default function HistoryPage() {
               </tbody>
             </table>
           </div>
-
           {visivel < filtered.length && (
             <div ref={loaderRef} className="flex justify-center py-4">
               <span className="text-xs text-muted-foreground animate-pulse">

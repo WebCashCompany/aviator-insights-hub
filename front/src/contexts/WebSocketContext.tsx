@@ -38,7 +38,7 @@ export function useWS() {
 // ─── Provider ─────────────────────────────────────────────────────────────────
 
 const WS_URL = import.meta.env.VITE_BOT_WS_URL || 'ws://localhost:3001'
-const MAX_CANDLES_IN_MEMORY = 200
+const MAX_CANDLES_IN_MEMORY = 1000
 const RECONNECT_DELAY_MS = 3000
 
 export function WebSocketProvider({ children }: { children: React.ReactNode }) {
