@@ -16,7 +16,7 @@ function formatHora(ts: string): string {
 type Filtro    = 'all' | 'blue' | 'purple' | 'pink'
 type Ordenacao = 'recent' | 'asc' | 'desc'
 type TabView   = 'grade' | 'lista'
-type Limite    = 50 | 100 | 200 | 500 | 1000
+type Limite    = number
 
 function VelaCard({ candle, isNew }: { candle: Candle; isNew: boolean }) {
   const ts = candle.created_at || candle.timestamp
@@ -186,9 +186,9 @@ export default function HistoryPage() {
     <div className="space-y-4 pb-6">
 
       {/* ── Filtro de Quantidade ── */}
-      <div className="flex items-center gap-1.5">
+      <div className="flex items-center gap-1.5 flex-wrap">
         <span className="text-xs text-muted-foreground mr-1">Últimas:</span>
-        {([50, 100, 200, 500, 1000] as Limite[]).map((n) => (
+        {[50, 100, 200, 500, 1000].map((n) => (
           <button
             key={n}
             onClick={() => setLimite(n)}
@@ -201,6 +201,28 @@ export default function HistoryPage() {
             {n}
           </button>
         ))}
+        <input
+          type="text"
+          inputMode="numeric"
+          pattern="[0-9]*"
+          maxLength={4}
+          value={![50, 100, 200, 500, 1000].includes(limite) ? String(limite) : ''}
+          onChange={(e) => {
+            const raw = e.target.value.replace(/[^0-9]/g, '')
+            if (raw === '') { setLimite(100); return }
+            const v = Math.min(1000, Math.max(1, parseInt(raw)))
+            setLimite(v)
+          }}
+          onBlur={(e) => {
+            if (e.target.value === '') setLimite(100)
+          }}
+          placeholder="outro"
+          className={`w-14 px-2 py-1 rounded-lg text-xs border bg-muted/40 placeholder:text-muted-foreground/50 focus:outline-none transition-all appearance-none [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none ${
+            ![50, 100, 200, 500, 1000].includes(limite)
+              ? 'border-foreground text-foreground bg-card'
+              : 'border-transparent text-muted-foreground hover:border-border'
+          }`}
+        />
         <span className="text-xs text-muted-foreground ml-auto">
           {candles.length} velas no total
         </span>
