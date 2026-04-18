@@ -22,8 +22,6 @@ const COLORS = {
 const LIMITS = [50, 100, 200, 500, 1000]
 
 // ─── Componente interno isolado ────────────────────────────────────────────────
-// Separar o conteúdo real do wrapper de ErrorBoundary garante que apenas
-// o conteúdo seja desmontado/remontado em caso de erro, sem afetar o layout.
 function DashboardContent() {
   const [limit, setLimit] = useState(100)
   const [importOpen, setImportOpen] = useState(false)
@@ -54,8 +52,8 @@ function DashboardContent() {
       .slice(-limit)
   }, [dbCandles, ws?.candles, limit])
 
-  const stats    = useMemo(() => calcularStats(candles), [candles])
-  const padroes  = useMemo(() => detectarPadroes(candles), [candles])
+  const stats   = useMemo(() => calcularStats(candles), [candles])
+  const padroes = useMemo(() => detectarPadroes(candles), [candles])
 
   const chartData = useMemo(
     () =>
@@ -247,6 +245,7 @@ function DashboardContent() {
           )
         })}
 
+        {/* ── Gráfico de pizza com tooltip ── */}
         <div className="glass-card p-2 flex items-center justify-center border border-white/10 bg-white/5 rounded-xl">
           <ResponsiveContainer width="100%" height={120}>
             <PieChart>
@@ -261,6 +260,16 @@ function DashboardContent() {
                   <Cell key={index} fill={entry.color} />
                 ))}
               </Pie>
+              <Tooltip
+                contentStyle={{
+                  background: '#0a0a0a',
+                  border: '1px solid #333',
+                  borderRadius: '8px',
+                  fontSize: '12px',
+                }}
+                itemStyle={{ color: '#fff' }}
+                formatter={(value: any, name: any) => [`${value} un`, name]}
+              />
             </PieChart>
           </ResponsiveContainer>
         </div>
