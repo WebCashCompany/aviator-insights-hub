@@ -18,6 +18,7 @@ import DashboardPage from "@/pages/Dashboard"
 import RealtimePage from "@/pages/Realtime"
 import StrategiesPage from "@/pages/Strategies"
 import ChartsPage from '@/pages/ChartsPage'
+import HistoryPage from '@/pages/HistoryPage' // ← NOVO
 import AIPage from "@/pages/AI"
 import SettingsPage from "@/pages/Settings"
 import NotFound from "@/pages/NotFound"
@@ -53,6 +54,7 @@ const App = () => (
                 <Route path="/dashboard" element={<DashboardPage />} />
                 <Route path="/realtime" element={<RealtimePage />} />
                 <Route path="/graficos" element={<ChartsPage />} />
+                <Route path="/historico" element={<HistoryPage />} /> {/* ← NOVO */}
                 <Route path="/strategies" element={<StrategiesPage />} />
                 <Route path="/ai" element={<AIPage />} />
                 <Route path="/settings" element={<SettingsPage />} />

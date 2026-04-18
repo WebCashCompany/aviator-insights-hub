@@ -8,7 +8,8 @@ import {
   Settings, 
   LogOut, 
   Plane,
-  LineChart // Ícone para a nova aba de Gráficos
+  LineChart,
+  History, // ← Ícone do Histórico
 } from 'lucide-react'
 
 // Hooks e Contextos
@@ -16,7 +17,7 @@ import { useAuth } from '@/contexts/AuthContext'
 import { useWebSocket } from '@/hooks/useWebSocket'
 import { WebSocketContext } from '@/contexts/WebSocketContext'
 
-// Componentes da Sidebar (Baseados no arquivo que você enviou)
+// Componentes da Sidebar
 import {
   Sidebar,
   SidebarContent,
@@ -32,14 +33,14 @@ import {
 } from "@/components/ui/sidebar"
 import { Button } from '@/components/ui/button'
 
-// Itens de Navegação atualizados com "Gráficos"
 const navItems = [
-  { to: '/dashboard', icon: BarChart2, label: 'Dashboard' },
-  { to: '/realtime', icon: Radio, label: 'Tempo Real' },
-  { to: '/graficos', icon: LineChart, label: 'Gráficos' }, // Nova aba adicionada aqui
-  { to: '/strategies', icon: Target, label: 'Estratégias' },
-  { to: '/ai', icon: Brain, label: 'IA' },
-  { to: '/settings', icon: Settings, label: 'Configurações' },
+  { to: '/dashboard',  icon: BarChart2,  label: 'Dashboard'     },
+  { to: '/realtime',   icon: Radio,      label: 'Tempo Real'    },
+  { to: '/graficos',   icon: LineChart,  label: 'Gráficos'      },
+  { to: '/historico',  icon: History,    label: 'Histórico'     }, // ← NOVA ABA
+  { to: '/strategies', icon: Target,     label: 'Estratégias'   },
+  { to: '/ai',         icon: Brain,      label: 'IA'            },
+  { to: '/settings',   icon: Settings,   label: 'Configurações' },
 ]
 
 export default function AppLayout() {
@@ -126,14 +127,13 @@ export default function AppLayout() {
               </div>
             </header>
 
-            {/* Onde suas páginas (como o ChartsPage) são renderizadas */}
             <main className="flex-1 p-4 lg:p-6 pb-20 lg:pb-6 overflow-x-hidden">
               <Outlet />
             </main>
 
-            {/* Navegação Mobile Inferior (Opcional - Mantido para facilitar o uso no celular) */}
+            {/* Navegação Mobile Inferior — mostra os 5 primeiros itens */}
             <nav className="lg:hidden fixed bottom-0 left-0 right-0 border-t border-border bg-card flex z-30 h-16">
-              {navItems.slice(0, 5).map(item => ( // Aumentado para 5 para incluir Gráficos no mobile
+              {navItems.slice(0, 5).map(item => (
                 <NavLink 
                   key={item.to} 
                   to={item.to}
