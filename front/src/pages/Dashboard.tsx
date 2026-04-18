@@ -37,8 +37,9 @@ ChartJS.register(
 )
 
 // ─── Threshold central ────────────────────────────────────────────────────────
-const THRESHOLD = 2   // acima = pagando bem | abaixo = pagando mal
-const Y_MAX_DISPLAY = 30  // cap visual do eixo Y (picos extremos não esmagam o gráfico)
+const THRESHOLD = 2
+const Y_MAX_DISPLAY = 30
+const MA_PERIOD = 10
 
 const COLORS = {
   blue:   '#378ADD',
@@ -50,6 +51,14 @@ const LIMITS = [50, 100, 200, 500, 1000]
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 const isAlta = (mult: number) => mult >= THRESHOLD
+
+function calcularMediaMovel(values: number[], period: number): (number | null)[] {
+  return values.map((_, i) => {
+    if (i < period - 1) return null
+    const slice = values.slice(i - period + 1, i + 1)
+    return slice.reduce((a, b) => a + b, 0) / period
+  })
+}
 
 function calcularTendencia(candles: any[]) {
   if (!candles?.length) return null
@@ -91,7 +100,7 @@ function TrendBadge({ t }: { t: ReturnType<typeof calcularTendencia> }) {
   )
 }
 
-// ─── Gráfico ──────────────────────────────────────────────────────────────────
+// ─── Gráfico com Média Móvel ──────────────────────────────────────────────────
 function TrendChart({ chartData }: { chartData: { index: number; mult: number; cor: string }[] }) {
   const isDark = typeof window !== 'undefined'
     ? window.matchMedia('(prefers-color-scheme: dark)').matches
@@ -99,35 +108,54 @@ function TrendChart({ chartData }: { chartData: { index: number; mult: number; c
 
   const realValues    = chartData.map(d => Number(d.mult))
   const displayValues = realValues.map(v => Math.min(v, Y_MAX_DISPLAY))
+  const maValues      = calcularMediaMovel(displayValues, MA_PERIOD)
   const labels        = chartData.map(d => String(d.index))
   const pointColors   = realValues.map(v => isAlta(v) ? '#22c55e' : '#ef4444')
   const pointStyles   = realValues.map(v => v > Y_MAX_DISPLAY ? 'triangle' : 'circle')
 
   const data = {
     labels,
-    datasets: [{
-      label: 'Multiplicador',
-      data: displayValues,
-      borderColor: '#4a90d9',
-      backgroundColor: (ctx: any) => {
-        const { chartArea, ctx: c } = ctx.chart
-        if (!chartArea) return 'rgba(55,138,221,0.08)'
-        const g = c.createLinearGradient(0, chartArea.top, 0, chartArea.bottom)
-        g.addColorStop(0,   'rgba(55,138,221,0.18)')
-        g.addColorStop(0.7, 'rgba(55,138,221,0.03)')
-        g.addColorStop(1,   'rgba(55,138,221,0.00)')
-        return g
+    datasets: [
+      // Dataset das velas (pontos + linha fina translúcida)
+      {
+        label: 'Multiplicador',
+        data: displayValues,
+        borderColor: 'rgba(74,144,217,0.30)',
+        backgroundColor: 'transparent',
+        fill: false,
+        borderWidth: 1,
+        tension: 0.2,
+        pointRadius: chartData.length <= 100 ? 4 : 2,
+        pointHoverRadius: 6,
+        pointBackgroundColor: pointColors,
+        pointBorderColor: isDark ? '#111' : '#fff',
+        pointBorderWidth: 1.5,
+        pointStyle: pointStyles,
+        order: 2,
       },
-      fill: true,
-      borderWidth: 1.6,
-      tension: 0.35,
-      pointRadius: chartData.length <= 100 ? 4 : 2,
-      pointHoverRadius: 6,
-      pointBackgroundColor: pointColors,
-      pointBorderColor: isDark ? '#111' : '#fff',
-      pointBorderWidth: 1.5,
-      pointStyle: pointStyles,
-    }],
+      // Dataset da Média Móvel (linha âmbar destacada)
+      {
+        label: `MM${MA_PERIOD}`,
+        data: maValues,
+        borderColor: '#f59e0b',
+        backgroundColor: (ctx: any) => {
+          const { chartArea, ctx: c } = ctx.chart
+          if (!chartArea) return 'rgba(245,158,11,0.05)'
+          const g = c.createLinearGradient(0, chartArea.top, 0, chartArea.bottom)
+          g.addColorStop(0,   'rgba(245,158,11,0.14)')
+          g.addColorStop(1,   'rgba(245,158,11,0.00)')
+          return g
+        },
+        fill: true,
+        borderWidth: 2.5,
+        tension: 0.45,
+        pointRadius: 0,
+        pointHoverRadius: 5,
+        pointHoverBackgroundColor: '#f59e0b',
+        spanGaps: false,
+        order: 1,
+      },
+    ],
   }
 
   const options: any = {
@@ -136,7 +164,18 @@ function TrendChart({ chartData }: { chartData: { index: number; mult: number; c
     animation: { duration: 280 },
     interaction: { mode: 'index', intersect: false },
     plugins: {
-      legend: { display: false },
+      legend: {
+        display: true,
+        position: 'top' as const,
+        align: 'end' as const,
+        labels: {
+          color: isDark ? '#888' : '#666',
+          font: { size: 11 },
+          boxWidth: 20,
+          usePointStyle: true,
+          padding: 12,
+        },
+      },
       tooltip: {
         backgroundColor: isDark ? '#111' : '#fff',
         borderColor:      isDark ? '#2a2a2a' : '#e0e0e0',
@@ -147,12 +186,21 @@ function TrendChart({ chartData }: { chartData: { index: number; mult: number; c
         callbacks: {
           title: (items: any[]) => `Vela #${items[0].label}`,
           label: (ctx: any) => {
-            const real   = realValues[ctx.dataIndex]
-            const status = isAlta(real) ? '✓ Acima de 2x' : '✗ Abaixo de 2x'
-            const suffix = real > Y_MAX_DISPLAY ? ` (pico real: ${real.toFixed(2)}x)` : ''
-            return ` ${real.toFixed(2)}x  ·  ${status}${suffix}`
+            if (ctx.datasetIndex === 0) {
+              const real   = realValues[ctx.dataIndex]
+              const status = isAlta(real) ? '✓ Acima de 2x' : '✗ Abaixo de 2x'
+              const suffix = real > Y_MAX_DISPLAY ? ` (pico real: ${real.toFixed(2)}x)` : ''
+              return ` Vela: ${real.toFixed(2)}x  ·  ${status}${suffix}`
+            }
+            if (ctx.datasetIndex === 1 && ctx.parsed.y !== null) {
+              return ` MM${MA_PERIOD}: ${ctx.parsed.y.toFixed(2)}x`
+            }
+            return ''
           },
           labelColor: (ctx: any) => {
+            if (ctx.datasetIndex === 1) {
+              return { backgroundColor: '#f59e0b', borderColor: '#f59e0b', borderRadius: 3 }
+            }
             const color = isAlta(realValues[ctx.dataIndex]) ? '#22c55e' : '#ef4444'
             return { backgroundColor: color, borderColor: color, borderRadius: 3 }
           },
@@ -305,10 +353,12 @@ function DashboardContent() {
     return { altasQtd, baixasQtd, total, streakCount, streakTipo }
   }, [candles])
 
-  const pieData = useMemo(() => [
-    { name: 'Abaixo de 2x', value: thresholdStats.baixasQtd, color: '#ef4444' },
-    { name: 'Acima de 2x',  value: thresholdStats.altasQtd,  color: '#22c55e' },
-  ], [thresholdStats])
+  // ── Dados do pie por COR de vela ──────────────────────────────────────────
+  const pieDataCores = useMemo(() => [
+    { name: 'Azul',  value: stats?.blue?.count   ?? 0, color: COLORS.blue },
+    { name: 'Roxa',  value: stats?.purple?.count ?? 0, color: COLORS.purple },
+    { name: 'Rosa',  value: stats?.pink?.count   ?? 0, color: COLORS.pink },
+  ], [stats])
 
   const exportCSV = () => {
     const csv = [
@@ -403,14 +453,14 @@ function DashboardContent() {
         {/* Legenda */}
         <div className="flex flex-wrap items-center gap-4 px-5 mt-3">
           <span className="flex items-center gap-1.5 text-xs text-green-400">
-            <span className="w-2.5 h-2.5 rounded-full bg-green-500" /> Acima de 2x 
+            <span className="w-2.5 h-2.5 rounded-full bg-green-500" /> Acima de 2x
           </span>
           <span className="flex items-center gap-1.5 text-xs text-red-400">
-            <span className="w-2.5 h-2.5 rounded-full bg-red-500" /> Abaixo de 2x 
+            <span className="w-2.5 h-2.5 rounded-full bg-red-500" /> Abaixo de 2x
           </span>
-          <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
-            <span className="inline-block w-5 border-t border-dashed border-white/35" />
-            Linha threshold 2x
+          <span className="flex items-center gap-1.5 text-xs" style={{ color: '#f59e0b' }}>
+            <span className="inline-block w-5 border-t-2 border-dashed" style={{ borderColor: '#f59e0b' }} />
+            MM{MA_PERIOD} (Média Móvel)
           </span>
           <span className="text-xs text-muted-foreground">· Y limitado a 30x</span>
         </div>
@@ -474,12 +524,21 @@ function DashboardContent() {
           )
         })}
 
-        {/* Pizza: acima vs abaixo de 2x */}
+        {/* Pizza: distribuição por COR de vela */}
         <div className="glass-card p-2 flex flex-col items-center justify-center border border-white/10 bg-white/5 rounded-xl gap-1">
+          <p className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider mt-2">Por cor</p>
           <ResponsiveContainer width="100%" height={100}>
             <PieChart>
-              <Pie data={pieData} innerRadius={30} outerRadius={44} dataKey="value" stroke="none">
-                {pieData.map((entry, i) => <Cell key={i} fill={entry.color} />)}
+              <Pie
+                data={pieDataCores}
+                innerRadius={30}
+                outerRadius={44}
+                dataKey="value"
+                stroke="none"
+              >
+                {pieDataCores.map((entry, i) => (
+                  <Cell key={i} fill={entry.color} />
+                ))}
               </Pie>
               <ReTooltip
                 contentStyle={{ background: '#0a0a0a', border: '1px solid #333', borderRadius: '8px', fontSize: '12px' }}
@@ -488,9 +547,16 @@ function DashboardContent() {
               />
             </PieChart>
           </ResponsiveContainer>
-          <div className="flex gap-3 text-[10px]">
-            <span className="flex items-center gap-1 text-green-400"><span className="w-2 h-2 rounded-full bg-green-500" /> ≥2x</span>
-            <span className="flex items-center gap-1 text-red-400"><span className="w-2 h-2 rounded-full bg-red-500" /> &lt;2x</span>
+          <div className="flex gap-2 text-[10px] pb-2">
+            <span className="flex items-center gap-1" style={{ color: COLORS.blue }}>
+              <span className="w-2 h-2 rounded-full" style={{ background: COLORS.blue }} /> Azul
+            </span>
+            <span className="flex items-center gap-1" style={{ color: COLORS.purple }}>
+              <span className="w-2 h-2 rounded-full" style={{ background: COLORS.purple }} /> Roxa
+            </span>
+            <span className="flex items-center gap-1" style={{ color: COLORS.pink }}>
+              <span className="w-2 h-2 rounded-full" style={{ background: COLORS.pink }} /> Rosa
+            </span>
           </div>
         </div>
       </div>
