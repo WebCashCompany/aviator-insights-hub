@@ -3,6 +3,7 @@ import { BrowserRouter, Route, Routes, Navigate } from "react-router-dom"
 import { Toaster as Sonner } from "@/components/ui/sonner"
 import { TooltipProvider } from "@/components/ui/tooltip"
 import { AuthProvider } from "@/contexts/AuthContext"
+import { WebSocketProvider } from "@/contexts/WebSocketContext"
 import ProtectedRoute from "@/components/ProtectedRoute"
 import AppLayout from "@/components/AppLayout"
 
@@ -33,34 +34,36 @@ const queryClient = new QueryClient({
 const App = () => (
   <QueryClientProvider client={queryClient}>
     <AuthProvider>
-      <TooltipProvider>
-        <Sonner position="top-right" expand={false} richColors />
-        <BrowserRouter>
-          <Routes>
-            {/* Redirecionamento Inicial */}
-            <Route path="/" element={<Navigate to="/dashboard" replace />} />
+      <WebSocketProvider>
+        <TooltipProvider>
+          <Sonner position="top-right" expand={false} richColors />
+          <BrowserRouter>
+            <Routes>
+              {/* Redirecionamento Inicial */}
+              <Route path="/" element={<Navigate to="/dashboard" replace />} />
 
-            {/* Rotas Públicas */}
-            <Route path="/login" element={<LoginPage />} />
-            <Route path="/register" element={<RegisterPage />} />
-            <Route path="/forgot-password" element={<ForgotPasswordPage />} />
-            <Route path="/reset-password" element={<ResetPasswordPage />} />
+              {/* Rotas Públicas */}
+              <Route path="/login" element={<LoginPage />} />
+              <Route path="/register" element={<RegisterPage />} />
+              <Route path="/forgot-password" element={<ForgotPasswordPage />} />
+              <Route path="/reset-password" element={<ResetPasswordPage />} />
 
-            {/* Rotas Privadas (Envolvidas pelo Layout e Proteção) */}
-            <Route element={<ProtectedRoute><AppLayout /></ProtectedRoute>}>
-              <Route path="/dashboard" element={<DashboardPage />} />
-              <Route path="/realtime" element={<RealtimePage />} />
-              <Route path="/graficos" element={<ChartsPage />} />
-              <Route path="/strategies" element={<StrategiesPage />} />
-              <Route path="/ai" element={<AIPage />} />
-              <Route path="/settings" element={<SettingsPage />} />
-            </Route>
+              {/* Rotas Privadas (Envolvidas pelo Layout e Proteção) */}
+              <Route element={<ProtectedRoute><AppLayout /></ProtectedRoute>}>
+                <Route path="/dashboard" element={<DashboardPage />} />
+                <Route path="/realtime" element={<RealtimePage />} />
+                <Route path="/graficos" element={<ChartsPage />} />
+                <Route path="/strategies" element={<StrategiesPage />} />
+                <Route path="/ai" element={<AIPage />} />
+                <Route path="/settings" element={<SettingsPage />} />
+              </Route>
 
-            {/* Rota 404 */}
-            <Route path="*" element={<NotFound />} />
-          </Routes>
-        </BrowserRouter>
-      </TooltipProvider>
+              {/* Rota 404 */}
+              <Route path="*" element={<NotFound />} />
+            </Routes>
+          </BrowserRouter>
+        </TooltipProvider>
+      </WebSocketProvider>
     </AuthProvider>
   </QueryClientProvider>
 )
