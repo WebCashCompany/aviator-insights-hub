@@ -25,7 +25,7 @@ const LIMITS = [50, 100, 200, 500, 1000]
 // Separar o conteúdo real do wrapper de ErrorBoundary garante que apenas
 // o conteúdo seja desmontado/remontado em caso de erro, sem afetar o layout.
 function DashboardContent() {
-  const [limit, setLimit] = useState(200)
+  const [limit, setLimit] = useState(100)
   const [importOpen, setImportOpen] = useState(false)
   const ws = useWS()
 
