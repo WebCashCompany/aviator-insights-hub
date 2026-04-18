@@ -1,176 +1,136 @@
-import { useMemo, useRef, useState, useEffect, useCallback } from 'react'
+import { useMemo, useRef } from 'react'
 import { useCandles } from '@/hooks/useCandles'
 import { useWS } from '@/contexts/WebSocketContext'
 import { calcularStats } from '@/utils/candleUtils'
 import {
-  AreaChart, Area,
-  BarChart, Bar,
-  LineChart, Line,
-  ScatterChart, Scatter,
-  RadarChart, Radar, PolarGrid, PolarAngleAxis,
-  XAxis, YAxis, ZAxis,
-  Tooltip, ResponsiveContainer, Cell,
-  CartesianGrid, ReferenceLine, Legend,
+  BarChart, Bar, LineChart, Line,
+  XAxis, YAxis, Tooltip, ResponsiveContainer, Cell,
+  CartesianGrid, ReferenceLine,
 } from 'recharts'
-import { format, isValid, getHours } from 'date-fns'
-import { TrendingUp, Activity, Clock, Zap, Target, BarChart2 } from 'lucide-react'
+import { TrendingUp, Activity, Zap, Target, ShieldAlert, CheckCircle2, XCircle, AlertTriangle } from 'lucide-react'
+import { getHours, isValid } from 'date-fns'
 
 // ── Paleta ─────────────────────────────────────────────────────────────────────
 const C = {
   blue:   'hsl(217,91%,60%)',
   purple: 'hsl(263,70%,58%)',
   pink:   'hsl(330,80%,60%)',
+  green:  'hsl(142,71%,45%)',
+  amber:  'hsl(38,92%,50%)',
   grid:   'rgba(255,255,255,0.06)',
   axis:   'rgba(255,255,255,0.25)',
-  bg:     'rgba(255,255,255,0.03)',
 }
 
-const TOOLTIP_STYLE = {
+const TT = {
   contentStyle: {
     background: '#0d0d0f',
     border: '1px solid rgba(255,255,255,0.1)',
-    borderRadius: '10px',
+    borderRadius: 10,
     fontSize: 12,
   },
   itemStyle: { color: '#fff' },
   labelStyle: { color: 'rgba(255,255,255,0.5)', fontSize: 11 },
 }
 
-// ── Hook: largura do container com debounce ────────────────────────────────────
-// Impede que cada pixel de animação do sidebar dispare re-render nos gráficos
+// ── Hook debounce width ─────────────────────────────────────────────────────────
 function useDebouncedWidth(ref: React.RefObject<HTMLDivElement>, delay = 120) {
-  const [width, setWidth] = useState(0)
-  const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
-
-  useEffect(() => {
-    if (!ref.current) return
-    const obs = new ResizeObserver(([entry]) => {
-      const w = entry.contentRect.width
-      if (timer.current) clearTimeout(timer.current)
-      timer.current = setTimeout(() => setWidth(w), delay)
-    })
-    obs.observe(ref.current)
-    // Leitura inicial
-    setWidth(ref.current.getBoundingClientRect().width)
-    return () => {
-      obs.disconnect()
-      if (timer.current) clearTimeout(timer.current)
-    }
-  }, [ref, delay])
-
-  return width
+  const [width, setWidth] = ([] as any[]).concat(
+    require !== undefined ? [] : []
+  )
+  // fallback simples sem ResizeObserver pra SSR
+  return 0
 }
 
-// ── Helpers ────────────────────────────────────────────────────────────────────
-function corColor(cor: string) { return C[cor as keyof typeof C] || C.blue }
+// ── Helpers da estratégia ──────────────────────────────────────────────────────
 
-function buildStreakHistory(candles: any[]) {
-  if (candles.length === 0) return []
-  const result: { index: number; streak: number; cor: string }[] = []
-  let streak = 1
-  for (let i = 1; i < candles.length; i++) {
-    if (candles[i].cor === candles[i - 1].cor) { streak++ }
-    else { streak = 1 }
-    result.push({ index: i, streak, cor: candles[i].cor })
-  }
-  return result
-}
-
-function buildIntervalRosa(candles: any[]) {
-  const intervals: { ocorrencia: number; intervalo: number; mult: number }[] = []
-  let lastIdx = -1
+/** Streak de azuis imediatamente antes do índice i */
+function streakAzulAntes(candles: any[], i: number): number {
   let count = 0
-  candles.forEach((c, i) => {
-    if (c.cor === 'pink') {
-      if (lastIdx >= 0) {
-        count++
-        intervals.push({ ocorrencia: count, intervalo: i - lastIdx, mult: Number(c.multiplicador) })
-      }
-      lastIdx = i
-    }
-  })
-  return intervals
-}
-
-function buildHeatmapHora(candles: any[]) {
-  const horas: Record<number, { blue: number; purple: number; pink: number; total: number }> = {}
-  for (let h = 0; h < 24; h++) horas[h] = { blue: 0, purple: 0, pink: 0, total: 0 }
-  candles.forEach(c => {
-    const d = new Date(c.created_at)
-    if (!isValid(d)) return
-    const h = getHours(d)
-    horas[h][c.cor as 'blue' | 'purple' | 'pink']++
-    horas[h].total++
-  })
-  return Object.entries(horas)
-    .filter(([, v]) => v.total > 0)
-    .map(([hora, v]) => ({
-      hora: `${hora}h`,
-      horaNum: Number(hora),
-      azul: v.blue,
-      roxa: v.purple,
-      rosa: v.pink,
-      total: v.total,
-      pctRosa: v.total > 0 ? Number(((v.pink / v.total) * 100).toFixed(1)) : 0,
-    }))
-    .sort((a, b) => a.horaNum - b.horaNum)
-}
-
-function buildCorrelacao(candles: any[]) {
-  return candles.slice(1).map((c, i) => ({
-    anterior: Number(candles[i].multiplicador),
-    atual: Number(c.multiplicador),
-    cor: c.cor,
-  }))
-}
-
-function buildRunLength(candles: any[]) {
-  if (candles.length === 0) return { blue: [], purple: [], pink: [] }
-  const runs: Record<string, number[]> = { blue: [], purple: [], pink: [] }
-  let cur = candles[0].cor
-  let len = 1
-  for (let i = 1; i < candles.length; i++) {
-    if (candles[i].cor === cur) { len++ }
-    else { runs[cur].push(len); cur = candles[i].cor; len = 1 }
+  for (let j = i - 1; j >= 0; j--) {
+    if (candles[j].cor === 'blue') count++
+    else break
   }
-  runs[cur].push(len)
-  const toFreq = (arr: number[]) => {
-    const freq: Record<number, number> = {}
-    arr.forEach(n => { freq[n] = (freq[n] || 0) + 1 })
-    return Object.entries(freq)
-      .map(([k, v]) => ({ tamanho: Number(k), frequencia: v }))
-      .sort((a, b) => a.tamanho - b.tamanho)
+  return count
+}
+
+/** Média das últimas N velas antes do índice i */
+function mediaAntes(candles: any[], i: number, n = 10): number {
+  const slice = candles.slice(Math.max(0, i - n), i)
+  if (!slice.length) return 0
+  return slice.reduce((s: number, c: any) => s + Number(c.multiplicador), 0) / slice.length
+}
+
+/** Houve rosa nas últimas N velas antes do índice i */
+function rosaRecenteAntes(candles: any[], i: number, n = 15): boolean {
+  return candles.slice(Math.max(0, i - n), i).some((c: any) => c.cor === 'pink')
+}
+
+/** % azuis nas últimas N velas antes do índice i */
+function pctAzulAntes(candles: any[], i: number, n = 10): number {
+  const slice = candles.slice(Math.max(0, i - n), i)
+  if (!slice.length) return 0
+  return slice.filter((c: any) => c.cor === 'blue').length / slice.length
+}
+
+/**
+ * Simula a estratégia ao longo do histórico:
+ * - Disparador: vela roxa aparece
+ * - Entrada: próxima vela
+ * - Bloqueio: 4+ azuis imediatamente antes da roxa
+ * - Mercado bom: média10 > 2x + rosa recente (15v) + pctAzul10 < 0.6
+ */
+function simularEstrategia(candles: any[]) {
+  const resultados: {
+    index: number
+    entrada: number        // multiplicador da vela de entrada
+    cor: string            // cor da vela de entrada
+    ganhou: boolean        // entrou em roxa ou rosa?
+    bloqueado: boolean
+    mercadoBom: boolean
+    streakAzul: number
+    mediaAnterior: number
+  }[] = []
+
+  for (let i = 1; i < candles.length - 1; i++) {
+    if (candles[i].cor !== 'purple') continue
+
+    const streak     = streakAzulAntes(candles, i)
+    const media      = mediaAntes(candles, i)
+    const rosaRecent = rosaRecenteAntes(candles, i)
+    const pctAzul    = pctAzulAntes(candles, i)
+
+    const bloqueado  = streak >= 4
+    const mercadoBom = media > 2 && rosaRecent && pctAzul < 0.6
+
+    const proxima    = candles[i + 1]
+    const ganhou     = proxima.cor === 'purple' || proxima.cor === 'pink'
+
+    resultados.push({
+      index: i + 1,
+      entrada: Number(proxima.multiplicador),
+      cor: proxima.cor,
+      ganhou,
+      bloqueado,
+      mercadoBom,
+      streakAzul: streak,
+      mediaAnterior: Number(media.toFixed(2)),
+    })
   }
-  return { blue: toFreq(runs.blue), purple: toFreq(runs.purple), pink: toFreq(runs.pink) }
+  return resultados
 }
 
-function buildRadar(candles: any[]) {
-  const stats = calcularStats(candles)
-  if (!stats || stats.total === 0) return []
-  const max = (v: number, m: number) => Math.min(100, Math.round((v / m) * 100))
-  return [
-    { metrica: 'Freq. Azul',  valor: Math.round(stats.blue.percent) },
-    { metrica: 'Freq. Roxa',  valor: Math.round(stats.purple.percent) },
-    { metrica: 'Freq. Rosa',  valor: Math.round(stats.pink.percent * 3) },
-    { metrica: 'Streak Azul', valor: max(stats.maiorStreakAzul, 20) },
-    { metrica: 'Streak Roxa', valor: max(stats.maiorStreakRoxa, 20) },
-    { metrica: 'Volatil.',    valor: max(stats.maior, 100) },
-  ]
-}
-
-// ── Card de Gráfico ────────────────────────────────────────────────────────────
-function ChartCard({ title, subtitle, icon: Icon, children, span = 1 }: {
+// ── Card ───────────────────────────────────────────────────────────────────────
+function Card({
+  title, subtitle, icon: Icon, children, accent,
+}: {
   title: string
   subtitle?: string
   icon: any
   children: React.ReactNode
-  span?: 1 | 2
+  accent?: string
 }) {
   return (
-    <div
-      className="rounded-2xl border border-white/8 bg-white/3 p-5 flex flex-col gap-4 backdrop-blur-sm"
-      style={{ gridColumn: span === 2 ? 'span 2' : 'span 1' }}
-    >
+    <div className="rounded-2xl border border-white/8 bg-white/3 p-5 flex flex-col gap-4">
       <div className="flex items-center gap-2.5">
         <div className="p-1.5 rounded-lg bg-white/5">
           <Icon className="h-4 w-4 text-white/50" />
@@ -179,28 +139,32 @@ function ChartCard({ title, subtitle, icon: Icon, children, span = 1 }: {
           <h3 className="text-sm font-semibold text-white/90 leading-none">{title}</h3>
           {subtitle && <p className="text-[11px] text-white/35 mt-0.5">{subtitle}</p>}
         </div>
+        {accent && (
+          <span className="ml-auto text-xs font-semibold px-2 py-0.5 rounded-full bg-white/5 text-white/60">
+            {accent}
+          </span>
+        )}
       </div>
       {children}
     </div>
   )
 }
 
-const CustomDot = (props: any) => {
-  const { cx, cy, payload } = props
-  return <circle cx={cx} cy={cy} r={3} fill={corColor(payload.cor)} fillOpacity={0.8} stroke="none" />
+// ── Stat pill ──────────────────────────────────────────────────────────────────
+function Stat({ label, value, color }: { label: string; value: string | number; color?: string }) {
+  return (
+    <div className="flex flex-col items-center gap-0.5 p-3 rounded-xl bg-white/5">
+      <span className="text-[10px] text-white/35 uppercase tracking-wider">{label}</span>
+      <span className="text-lg font-bold" style={{ color: color || '#fff' }}>{value}</span>
+    </div>
+  )
 }
 
 // ── Página Principal ───────────────────────────────────────────────────────────
 export default function ChartsPage() {
   const ws = useWS()
-  const containerRef = useRef<HTMLDivElement>(null)
-
-  // Largura debounced — só re-renderiza gráficos após sidebar terminar animação
-  const containerWidth = useDebouncedWidth(containerRef as React.RefObject<HTMLDivElement>, 120)
-
   const { candles: dbCandles } = useCandles({ limit: 500 })
 
-  // Mescla WS + banco (mesmo padrão do Dashboard)
   const candles = useMemo(() => {
     const wsCandles: any[] = Array.isArray(ws?.candles) ? ws.candles : []
     const key = (c: any) => {
@@ -216,67 +180,206 @@ export default function ChartsPage() {
 
   const stats = useMemo(() => calcularStats(candles), [candles])
 
-  const multSerie = useMemo(() =>
-    candles.map((c, i) => ({ i: i + 1, v: Number(c.multiplicador), cor: c.cor })),
+  // ── Simulação da estratégia ──────────────────────────────────────────────────
+  const simulacao = useMemo(() => simularEstrategia(candles), [candles])
+
+  const totalEntradas    = simulacao.filter(r => !r.bloqueado).length
+  const entradasBoas     = simulacao.filter(r => !r.bloqueado && r.mercadoBom)
+  const totalBloqueadas  = simulacao.filter(r => r.bloqueado).length
+
+  const taxaGeral        = totalEntradas > 0
+    ? (simulacao.filter(r => !r.bloqueado && r.ganhou).length / totalEntradas * 100).toFixed(1)
+    : '—'
+
+  const taxaMercadoBom   = entradasBoas.length > 0
+    ? (entradasBoas.filter(r => r.ganhou).length / entradasBoas.length * 100).toFixed(1)
+    : '—'
+
+  const taxaSemFiltro    = simulacao.length > 0
+    ? (simulacao.filter(r => r.ganhou).length / simulacao.length * 100).toFixed(1)
+    : '—'
+
+  // ── Gráfico 1: Win/Loss por entrada ─────────────────────────────────────────
+  const entradaTimeline = useMemo(() =>
+    simulacao
+      .filter(r => !r.bloqueado)
+      .slice(-60)
+      .map((r, i) => ({
+        i: i + 1,
+        resultado: r.ganhou ? 1 : -1,
+        cor: r.cor,
+        entrada: r.entrada,
+        mercadoBom: r.mercadoBom,
+      })),
+    [simulacao]
+  )
+
+  // ── Gráfico 2: Taxa de sucesso por streak azul antes ─────────────────────────
+  const taxaPorStreak = useMemo(() => {
+    const grupos: Record<number, { wins: number; total: number }> = {}
+    simulacao.forEach(r => {
+      const k = Math.min(r.streakAzul, 6)
+      if (!grupos[k]) grupos[k] = { wins: 0, total: 0 }
+      grupos[k].total++
+      if (r.ganhou) grupos[k].wins++
+    })
+    return Object.entries(grupos)
+      .map(([k, v]) => ({
+        streak: Number(k),
+        label: Number(k) >= 6 ? '6+' : `${k}`,
+        taxa: v.total > 0 ? Number((v.wins / v.total * 100).toFixed(1)) : 0,
+        total: v.total,
+        bloqueado: Number(k) >= 4,
+      }))
+      .sort((a, b) => a.streak - b.streak)
+  }, [simulacao])
+
+  // ── Gráfico 3: O que vem após uma roxa? ──────────────────────────────────────
+  const aposRoxa = useMemo(() => {
+    let blue = 0, purple = 0, pink = 0, total = 0
+    for (let i = 0; i < candles.length - 1; i++) {
+      if (candles[i].cor !== 'purple') continue
+      total++
+      const prox = candles[i + 1].cor
+      if (prox === 'blue')   blue++
+      if (prox === 'purple') purple++
+      if (prox === 'pink')   pink++
+    }
+    return [
+      { label: 'Azul',  count: blue,   pct: total ? +(blue   / total * 100).toFixed(1) : 0, cor: 'blue'   },
+      { label: 'Roxa',  count: purple, pct: total ? +(purple / total * 100).toFixed(1) : 0, cor: 'purple' },
+      { label: 'Rosa',  count: pink,   pct: total ? +(pink   / total * 100).toFixed(1) : 0, cor: 'pink'   },
+    ]
+  }, [candles])
+
+  // ── Gráfico 4: Média móvel 10 — "mercado pagando bem?" ────────────────────────
+  const mediaMovel = useMemo(() =>
+    candles.slice(-80).map((c, i, arr) => {
+      const slice = arr.slice(Math.max(0, i - 9), i + 1)
+      const ma = slice.reduce((s: number, x: any) => s + Number(x.multiplicador), 0) / slice.length
+      const pctAzul = slice.filter((x: any) => x.cor === 'blue').length / slice.length
+      return {
+        i: i + 1,
+        ma: Number(ma.toFixed(2)),
+        pctAzul: Number((pctAzul * 100).toFixed(1)),
+        cor: c.cor,
+        mult: Number(c.multiplicador).toFixed(2),
+      }
+    }),
     [candles]
   )
 
-  const distData = useMemo(() => {
-    const buckets: Record<string, { label: string; count: number; cor: string }> = {
-      '1-2':   { label: '1–2x',   count: 0, cor: 'blue' },
-      '2-5':   { label: '2–5x',   count: 0, cor: 'purple' },
-      '5-10':  { label: '5–10x',  count: 0, cor: 'purple' },
-      '10-20': { label: '10–20x', count: 0, cor: 'pink' },
-      '20+':   { label: '20x+',   count: 0, cor: 'pink' },
+  // ── Gráfico 5: Após N azuis consecutivas, o que veio? ────────────────────────
+  const aposNAzuis = useMemo(() => {
+    const grupos: Record<number, { blue: number; purple: number; pink: number }> = {}
+    for (let n = 0; n <= 7; n++) grupos[n] = { blue: 0, purple: 0, pink: 0 }
+    for (let i = 1; i < candles.length; i++) {
+      if (candles[i].cor === 'blue') continue
+      const streak = streakAzulAntes(candles, i)
+      const k = Math.min(streak, 7)
+      const cor = candles[i].cor as 'blue' | 'purple' | 'pink'
+      grupos[k][cor]++
     }
-    candles.forEach(c => {
-      const v = Number(c.multiplicador)
-      if (v < 2)       buckets['1-2'].count++
-      else if (v < 5)  buckets['2-5'].count++
-      else if (v < 10) buckets['5-10'].count++
-      else if (v < 20) buckets['10-20'].count++
-      else             buckets['20+'].count++
-    })
-    return Object.values(buckets)
+    return Object.entries(grupos)
+      .filter(([, v]) => v.blue + v.purple + v.pink > 0)
+      .map(([k, v]) => {
+        const total = v.blue + v.purple + v.pink
+        return {
+          label: Number(k) >= 7 ? '7+' : `${k} azuis`,
+          streak: Number(k),
+          blue:   Number((v.blue   / total * 100).toFixed(1)),
+          purple: Number((v.purple / total * 100).toFixed(1)),
+          pink:   Number((v.pink   / total * 100).toFixed(1)),
+          total,
+          bloqueado: Number(k) >= 4,
+        }
+      })
+      .sort((a, b) => a.streak - b.streak)
   }, [candles])
 
-  const streakHistory = useMemo(() => buildStreakHistory(candles), [candles])
-  const intervalRosa  = useMemo(() => buildIntervalRosa(candles), [candles])
-  const heatmap       = useMemo(() => buildHeatmapHora(candles), [candles])
-  const correlacao    = useMemo(() => buildCorrelacao(candles), [candles])
-  const runLength     = useMemo(() => buildRunLength(candles), [candles])
-  const radarData     = useMemo(() => buildRadar(candles), [candles])
-
-  const mediaMovel = useMemo(() => {
-    const W = 10
-    return multSerie.map((d, i) => {
-      if (i < W - 1) return { ...d, ma: null }
-      const slice = multSerie.slice(i - W + 1, i + 1)
-      const ma = slice.reduce((s, x) => s + x.v, 0) / W
-      return { ...d, ma: Number(ma.toFixed(2)) }
+  // ── Gráfico 6: Hora do dia × taxa de sucesso da estratégia ───────────────────
+  const taxaPorHora = useMemo(() => {
+    const horas: Record<number, { wins: number; total: number }> = {}
+    for (let h = 0; h < 24; h++) horas[h] = { wins: 0, total: 0 }
+    simulacao.filter(r => !r.bloqueado && r.mercadoBom).forEach(r => {
+      const d = new Date(candles[r.index]?.created_at || '')
+      if (!isValid(d)) return
+      const h = getHours(d)
+      horas[h].total++
+      if (r.ganhou) horas[h].wins++
     })
-  }, [multSerie])
+    return Object.entries(horas)
+      .filter(([, v]) => v.total >= 2)
+      .map(([h, v]) => ({
+        hora: `${h}h`,
+        horaNum: Number(h),
+        taxa: Number((v.wins / v.total * 100).toFixed(1)),
+        total: v.total,
+      }))
+      .sort((a, b) => a.horaNum - b.horaNum)
+  }, [simulacao, candles])
 
-  if (candles.length < 5) {
+  // ── Estado atual do mercado ──────────────────────────────────────────────────
+  const estadoAtual = useMemo(() => {
+    if (candles.length < 10) return null
+    const ultimas = candles.slice(-10)
+    const media   = ultimas.reduce((s: number, c: any) => s + Number(c.multiplicador), 0) / 10
+    const pctAzul = ultimas.filter((c: any) => c.cor === 'blue').length / 10
+    const rosaRec = candles.slice(-15).some((c: any) => c.cor === 'pink')
+    const streakAtual = (() => {
+      let s = 0
+      for (let i = candles.length - 1; i >= 0; i--) {
+        if (candles[i].cor === 'blue') s++
+        else break
+      }
+      return s
+    })()
+    const ultimaCor = candles[candles.length - 1]?.cor
+    const mercadoBom = media > 2 && rosaRec && pctAzul < 0.6
+
+    return { media, pctAzul, rosaRec, streakAtual, ultimaCor, mercadoBom }
+  }, [candles])
+
+  // ── Sinal da estratégia agora ─────────────────────────────────────────────────
+  const sinalAtual = useMemo(() => {
+    if (!estadoAtual) return null
+    const ultimaCor   = estadoAtual.ultimaCor
+    const streakAtual = estadoAtual.streakAtual
+    const mercadoBom  = estadoAtual.mercadoBom
+
+    if (ultimaCor === 'purple') {
+      if (streakAtual >= 4) return { tipo: 'bloqueado', msg: 'Roxa detectada, mas bloqueado: 4+ azuis antes', color: C.amber }
+      if (!mercadoBom)       return { tipo: 'cautela',  msg: 'Roxa detectada, mas mercado não está bom',       color: C.amber }
+      return                        { tipo: 'entrar',   msg: 'ENTRAR na próxima — roxa + mercado bom!',        color: C.green }
+    }
+    if (ultimaCor === 'blue') {
+      if (streakAtual >= 4)  return { tipo: 'bloqueado', msg: `Cuidado: ${streakAtual} azuis seguidas — aguardar`, color: C.amber }
+      return                        { tipo: 'aguardar',  msg: 'Aguardando roxa disparar entrada',               color: C.axis  }
+    }
+    if (ultimaCor === 'pink') {
+      return { tipo: 'aguardar', msg: 'Rosa saiu — observar próximas velas', color: C.purple }
+    }
+    return { tipo: 'aguardar', msg: 'Aguardando sinal...', color: C.axis }
+  }, [estadoAtual])
+
+  if (candles.length < 10) {
     return (
-      <div className="flex items-center justify-center h-64 text-white/30 text-sm p-4">
-        Aguardando dados suficientes para gerar análises...
+      <div className="flex items-center justify-center h-64 text-white/30 text-sm">
+        Aguardando dados suficientes para análise...
       </div>
     )
   }
 
-  // Dimensões derivadas da largura debounced — evita ResponsiveContainer
-  // recalculando a cada frame durante a animação do sidebar
-  const isWide      = containerWidth > 768
-  const colWidth    = isWide ? (containerWidth - 48) / 2 : containerWidth - 32
-  const fullWidth   = containerWidth - 32
+  const colW = 'w-full'
 
   return (
-    <div ref={containerRef} className="p-4 pb-24 lg:pb-6 space-y-4">
-      <div className="flex items-center justify-between mb-2">
+    <div className="p-4 pb-24 lg:pb-6 space-y-4">
+
+      {/* ── Header ── */}
+      <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-lg font-bold text-white">Análise Gráfica</h1>
-          <p className="text-xs text-white/35 mt-0.5">{candles.length} velas · sessão atual</p>
+          <h1 className="text-lg font-bold text-white">Análise de Estratégia</h1>
+          <p className="text-xs text-white/35 mt-0.5">{candles.length} velas analisadas</p>
         </div>
         {ws?.connected && (
           <span className="flex items-center gap-1.5 text-xs text-emerald-400 font-medium">
@@ -289,345 +392,293 @@ export default function ChartsPage() {
         )}
       </div>
 
+      {/* ── SINAL ATUAL ── */}
+      {sinalAtual && (
+        <div
+          className="rounded-2xl border p-4 flex items-center gap-4"
+          style={{
+            borderColor: sinalAtual.color + '55',
+            background: sinalAtual.color + '11',
+          }}
+        >
+          {sinalAtual.tipo === 'entrar'    && <CheckCircle2  className="h-7 w-7 shrink-0" style={{ color: C.green  }} />}
+          {sinalAtual.tipo === 'bloqueado' && <ShieldAlert   className="h-7 w-7 shrink-0" style={{ color: C.amber  }} />}
+          {sinalAtual.tipo === 'cautela'   && <AlertTriangle className="h-7 w-7 shrink-0" style={{ color: C.amber  }} />}
+          {sinalAtual.tipo === 'aguardar'  && <Activity      className="h-7 w-7 shrink-0" style={{ color: C.purple }} />}
+          <div className="flex-1">
+            <p className="text-xs text-white/40 uppercase tracking-wider mb-0.5">Sinal agora</p>
+            <p className="text-sm font-semibold text-white">{sinalAtual.msg}</p>
+          </div>
+          {estadoAtual && (
+            <div className="hidden sm:flex flex-col items-end gap-0.5 text-right text-xs text-white/40">
+              <span>Média 10v: <strong className="text-white/70">{estadoAtual.media.toFixed(2)}x</strong></span>
+              <span>Azuis 10v: <strong className="text-white/70">{(estadoAtual.pctAzul * 100).toFixed(0)}%</strong></span>
+              <span>Streak azul: <strong className="text-white/70">{estadoAtual.streakAtual}</strong></span>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── KPIs da estratégia ── */}
+      <Card title="Performance da Estratégia" subtitle="Backtest em todo o histórico disponível" icon={Target}>
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+          <Stat label="Taxa sem filtro"    value={`${taxaSemFiltro}%`}   color="rgba(255,255,255,0.4)" />
+          <Stat label="Taxa c/ bloqueio"   value={`${taxaGeral}%`}       color={C.purple} />
+          <Stat label="Taxa mercado bom"   value={`${taxaMercadoBom}%`}  color={C.green}  />
+          <Stat label="Entradas bloqueadas" value={totalBloqueadas}       color={C.amber}  />
+        </div>
+        <p className="text-[11px] text-white/25 text-center">
+          O filtro de "mercado bom" melhora a taxa de {taxaGeral}% → {taxaMercadoBom}%
+        </p>
+      </Card>
+
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
 
-        {/* ── Multiplicadores ao longo do tempo ── */}
-        <ChartCard
-          title="Multiplicadores ao Longo do Tempo"
-          subtitle={`Média móvel 10 períodos · pico ${stats?.maior?.toFixed(2)}x`}
-          icon={TrendingUp}
-          span={2}
+        {/* ── Após uma roxa, o que vem? ── */}
+        <Card
+          title="O que vem após uma Roxa?"
+          subtitle={`Base: ${aposRoxa.reduce((s, r) => s + r.count, 0)} ocorrências`}
+          icon={Zap}
         >
-          <div className="h-[220px]">
-            <AreaChart
-              width={fullWidth}
-              height={220}
-              data={mediaMovel}
-              margin={{ left: -20, right: 4 }}
-            >
-              <defs>
-                <linearGradient id="gMult" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%"  stopColor={C.blue} stopOpacity={0.25}/>
-                  <stop offset="95%" stopColor={C.blue} stopOpacity={0}/>
-                </linearGradient>
-              </defs>
-              <CartesianGrid stroke={C.grid} vertical={false} />
-              <XAxis dataKey="i" hide />
-              <YAxis stroke={C.axis} fontSize={10} tickFormatter={v => `${v}x`} />
-              <Tooltip {...TOOLTIP_STYLE} formatter={(v: any) => [`${Number(v).toFixed(2)}x`]} />
-              <ReferenceLine y={2}  stroke={C.purple} strokeDasharray="3 3" strokeOpacity={0.5} />
-              <ReferenceLine y={10} stroke={C.pink}   strokeDasharray="3 3" strokeOpacity={0.5} />
-              <Area  dataKey="v"  stroke={C.blue} fill="url(#gMult)" strokeWidth={1.5} dot={false} name="Multiplicador" />
-              <Line  dataKey="ma" stroke={C.pink} strokeWidth={2}    dot={false} strokeDasharray="4 2" name="Média 10p" connectNulls />
-            </AreaChart>
+          <div className="space-y-3">
+            {aposRoxa.map((r) => (
+              <div key={r.label} className="space-y-1">
+                <div className="flex items-center justify-between text-xs">
+                  <span style={{ color: C[r.cor as keyof typeof C] }} className="font-medium">{r.label}</span>
+                  <span className="text-white/60">{r.pct}% ({r.count}x)</span>
+                </div>
+                <div className="h-2 rounded-full bg-white/5 overflow-hidden">
+                  <div
+                    className="h-full rounded-full transition-all duration-700"
+                    style={{ width: `${r.pct}%`, background: C[r.cor as keyof typeof C] }}
+                  />
+                </div>
+              </div>
+            ))}
           </div>
-        </ChartCard>
+          <p className="text-[11px] text-white/30">
+            Roxa + Roxa consecutiva acontece em {aposRoxa.find(r => r.cor === 'purple')?.pct ?? 0}% dos casos
+          </p>
+        </Card>
 
-        {/* ── Distribuição por faixa ── */}
-        <ChartCard
-          title="Distribuição por Faixa"
-          subtitle="Quantas velas caíram em cada faixa de multiplicador"
-          icon={BarChart2}
-        >
-          <div className="h-[200px]">
-            <BarChart width={colWidth} height={200} data={distData} margin={{ left: -20, right: 4 }}>
-              <CartesianGrid stroke={C.grid} vertical={false} />
-              <XAxis dataKey="label" stroke={C.axis} fontSize={10} />
-              <YAxis stroke={C.axis} fontSize={10} />
-              <Tooltip {...TOOLTIP_STYLE} formatter={(v: any) => [`${v} velas`]} />
-              <Bar dataKey="count" radius={[6,6,0,0]} name="Velas">
-                {distData.map((d, i) => <Cell key={i} fill={corColor(d.cor)} fillOpacity={0.85} />)}
-              </Bar>
-            </BarChart>
-          </div>
-        </ChartCard>
-
-        {/* ── Streak history ── */}
-        <ChartCard
-          title="Comprimento de Streak por Vela"
-          subtitle="Tamanho da sequência consecutiva em cada ponto"
+        {/* ── Taxa por streak azul ── */}
+        <Card
+          title="Taxa de Acerto × Streak Azul"
+          subtitle="Quantas azuis antes da roxa → quanto você ganha"
           icon={Activity}
         >
           <div className="h-[200px]">
-            <BarChart
-              width={colWidth}
-              height={200}
-              data={streakHistory.slice(-80)}
-              margin={{ left: -20, right: 4 }}
-            >
-              <CartesianGrid stroke={C.grid} vertical={false} />
-              <XAxis dataKey="index" hide />
-              <YAxis stroke={C.axis} fontSize={10} allowDecimals={false} />
-              <Tooltip
-                {...TOOLTIP_STYLE}
-                formatter={(v: any, _: any, p: any) => [
-                  `${v} seguidas`,
-                  p.payload.cor === 'blue' ? 'Azul' : p.payload.cor === 'purple' ? 'Roxa' : 'Rosa',
-                ]}
-              />
-              <Bar dataKey="streak" radius={[3,3,0,0]} name="Streak">
-                {streakHistory.slice(-80).map((d, i) => (
-                  <Cell key={i} fill={corColor(d.cor)} fillOpacity={0.8} />
-                ))}
-              </Bar>
-            </BarChart>
-          </div>
-        </ChartCard>
-
-        {/* ── Intervalo entre Rosas ── */}
-        <ChartCard
-          title="Intervalo Entre Rosas (10x+)"
-          subtitle="Quantas velas entre cada aparição Rosa"
-          icon={Zap}
-        >
-          {intervalRosa.length < 2 ? (
-            <div className="h-[200px] flex items-center justify-center text-white/25 text-xs">
-              Aguardando mais aparições Rosa...
-            </div>
-          ) : (
-            <div className="h-[200px]">
-              <BarChart
-                width={colWidth}
-                height={200}
-                data={intervalRosa}
-                margin={{ left: -20, right: 4 }}
-              >
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={taxaPorStreak} margin={{ left: -20, right: 4 }}>
                 <CartesianGrid stroke={C.grid} vertical={false} />
-                <XAxis dataKey="ocorrencia" stroke={C.axis} fontSize={10} tickFormatter={v => `#${v}`} />
-                <YAxis
+                <XAxis
+                  dataKey="label"
                   stroke={C.axis}
                   fontSize={10}
-                  label={{ value: 'velas', angle: -90, position: 'insideLeft', fill: C.axis, fontSize: 9, dx: 20 }}
+                  tickFormatter={(v, i) => taxaPorStreak[i]?.bloqueado ? `🚫${v}` : v}
                 />
+                <YAxis stroke={C.axis} fontSize={10} tickFormatter={v => `${v}%`} domain={[0, 100]} />
+                <ReferenceLine y={50} stroke="rgba(255,255,255,0.15)" strokeDasharray="3 3" />
                 <Tooltip
-                  {...TOOLTIP_STYLE}
-                  formatter={(v: any, n: any, p: any) => [
-                    `${v} velas · ${p.payload.mult}x`,
-                    'Intervalo',
-                  ]}
-                />
-                <ReferenceLine
-                  y={intervalRosa.reduce((s, d) => s + d.intervalo, 0) / intervalRosa.length}
-                  stroke={C.purple}
-                  strokeDasharray="4 2"
-                  label={{ value: 'média', fill: C.purple, fontSize: 9 }}
-                />
-                <Bar dataKey="intervalo" fill={C.pink} fillOpacity={0.7} radius={[4,4,0,0]} name="Intervalo" />
-              </BarChart>
-            </div>
-          )}
-        </ChartCard>
-
-        {/* ── % Rosa por horário ── */}
-        <ChartCard
-          title="% Rosa por Horário"
-          subtitle="Em quais horas Rosa (10x+) aparece mais"
-          icon={Clock}
-          span={2}
-        >
-          {heatmap.length < 2 ? (
-            <div className="h-[180px] flex items-center justify-center text-white/25 text-xs">
-              Dados insuficientes por horário...
-            </div>
-          ) : (
-            <div className="h-[180px]">
-              <BarChart
-                width={fullWidth}
-                height={180}
-                data={heatmap}
-                margin={{ left: -20, right: 4 }}
-              >
-                <CartesianGrid stroke={C.grid} vertical={false} />
-                <XAxis dataKey="hora" stroke={C.axis} fontSize={10} />
-                <YAxis stroke={C.axis} fontSize={10} tickFormatter={v => `${v}%`} />
-                <Tooltip
-                  {...TOOLTIP_STYLE}
+                  {...TT}
                   content={({ active, payload }) => {
                     if (!active || !payload?.length) return null
                     const d = payload[0].payload
                     return (
-                      <div style={TOOLTIP_STYLE.contentStyle} className="p-3 space-y-1">
-                        <p className="font-bold text-white">{d.hora}</p>
-                        <p style={{ color: C.blue   }}>Azul: {d.azul}</p>
-                        <p style={{ color: C.purple }}>Roxa: {d.roxa}</p>
-                        <p style={{ color: C.pink   }}>Rosa: {d.rosa} ({d.pctRosa}%)</p>
+                      <div style={TT.contentStyle} className="p-2 space-y-1 text-xs">
+                        <p className="text-white font-bold">{d.label} azuis antes</p>
+                        <p style={{ color: C.green }}>Taxa: {d.taxa}%</p>
+                        <p className="text-white/40">Amostras: {d.total}</p>
+                        {d.bloqueado && <p style={{ color: C.amber }}>⚠️ Bloqueado pela regra</p>}
+                      </div>
+                    )
+                  }}
+                />
+                <Bar dataKey="taxa" radius={[6, 6, 0, 0]} name="Taxa">
+                  {taxaPorStreak.map((d, i) => (
+                    <Cell
+                      key={i}
+                      fill={d.bloqueado ? C.amber : d.taxa >= 50 ? C.green : C.purple}
+                      fillOpacity={d.bloqueado ? 0.4 : 0.85}
+                    />
+                  ))}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+          <p className="text-[11px] text-white/30">
+            Barras laranja = bloqueadas pela sua regra das 4 azuis
+          </p>
+        </Card>
+
+        {/* ── Após N azuis, o que veio? ── */}
+        <Card
+          title="Após N Azuis Consecutivas → Próxima Cor"
+          subtitle="Distribuição do que saiu após cada sequência de azuis"
+          icon={ShieldAlert}
+          span={undefined}
+        >
+          <div className="h-[220px]">
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={aposNAzuis} margin={{ left: -20, right: 4 }}>
+                <CartesianGrid stroke={C.grid} vertical={false} />
+                <XAxis dataKey="label" stroke={C.axis} fontSize={10} />
+                <YAxis stroke={C.axis} fontSize={10} tickFormatter={v => `${v}%`} domain={[0, 100]} />
+                <ReferenceLine x="4 azuis" stroke={C.amber} strokeDasharray="4 2" label={{ value: 'bloqueio', fill: C.amber, fontSize: 9 }} />
+                <Tooltip
+                  {...TT}
+                  content={({ active, payload }) => {
+                    if (!active || !payload?.length) return null
+                    const d = payload[0].payload
+                    return (
+                      <div style={TT.contentStyle} className="p-2 space-y-1 text-xs">
+                        <p className="text-white font-bold">{d.label}</p>
+                        <p style={{ color: C.blue }}>Azul: {d.blue}%</p>
+                        <p style={{ color: C.purple }}>Roxa: {d.purple}%</p>
+                        <p style={{ color: C.pink }}>Rosa: {d.pink}%</p>
                         <p className="text-white/40">Total: {d.total}</p>
                       </div>
                     )
                   }}
                 />
-                <Bar dataKey="pctRosa" radius={[4,4,0,0]} name="% Rosa">
-                  {heatmap.map((d, i) => (
-                    <Cell key={i} fill={C.pink} fillOpacity={0.15 + (d.pctRosa / 100) * 0.85} />
+                <Bar dataKey="blue"   stackId="a" fill={C.blue}   fillOpacity={0.8} name="Azul"  radius={[0,0,0,0]} />
+                <Bar dataKey="purple" stackId="a" fill={C.purple} fillOpacity={0.8} name="Roxa" />
+                <Bar dataKey="pink"   stackId="a" fill={C.pink}   fillOpacity={0.8} name="Rosa"  radius={[4,4,0,0]} />
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+          <p className="text-[11px] text-white/30">
+            A linha laranja marca onde sua regra bloqueia entradas
+          </p>
+        </Card>
+
+        {/* ── Média móvel / mercado bom ── */}
+        <Card
+          title="Média Móvel 10 Velas + % Azuis"
+          subtitle="Identifique quando o mercado está 'pagando bem'"
+          icon={TrendingUp}
+        >
+          <div className="h-[220px]">
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={mediaMovel} margin={{ left: -20, right: 4 }}>
+                <CartesianGrid stroke={C.grid} vertical={false} />
+                <XAxis dataKey="i" hide />
+                <YAxis yAxisId="ma" stroke={C.axis} fontSize={10} tickFormatter={v => `${v}x`} />
+                <YAxis yAxisId="pct" orientation="right" stroke={C.axis} fontSize={10} tickFormatter={v => `${v}%`} domain={[0, 100]} />
+                <ReferenceLine yAxisId="ma" y={2} stroke={C.purple} strokeDasharray="3 3" strokeOpacity={0.6} label={{ value: '2x', fill: C.purple, fontSize: 9 }} />
+                <ReferenceLine yAxisId="pct" y={60} stroke={C.amber} strokeDasharray="3 3" strokeOpacity={0.6} label={{ value: '60%az', fill: C.amber, fontSize: 9 }} />
+                <Tooltip
+                  {...TT}
+                  content={({ active, payload }) => {
+                    if (!active || !payload?.length) return null
+                    const d = payload[0]?.payload
+                    const bom = d?.ma > 2 && d?.pctAzul < 60
+                    return (
+                      <div style={TT.contentStyle} className="p-2 space-y-1 text-xs">
+                        <p style={{ color: C.blue }}>Média 10v: {d?.ma}x</p>
+                        <p style={{ color: C.amber }}>% Azuis: {d?.pctAzul}%</p>
+                        <p style={{ color: bom ? C.green : C.amber }}>
+                          Mercado: {bom ? '✅ bom' : '⚠️ ruim'}
+                        </p>
+                      </div>
+                    )
+                  }}
+                />
+                <Line yAxisId="ma"  dataKey="ma"      stroke={C.blue}   strokeWidth={2} dot={false} name="Média 10v" />
+                <Line yAxisId="pct" dataKey="pctAzul" stroke={C.amber}  strokeWidth={1.5} dot={false} strokeDasharray="4 2" name="% Azuis" />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+          <div className="flex gap-4 text-[11px] text-white/40">
+            <span style={{ color: C.blue }}>— Média 10v (meta: acima de 2x)</span>
+            <span style={{ color: C.amber }}>-- % Azuis (meta: abaixo de 60%)</span>
+          </div>
+        </Card>
+
+        {/* ── Timeline de entradas Win/Loss ── */}
+        <Card
+          title="Histórico de Entradas"
+          subtitle="Últimas 60 entradas disparadas pela estratégia"
+          icon={CheckCircle2}
+          accent={`${simulacao.filter(r => !r.bloqueado && r.ganhou).length}W / ${simulacao.filter(r => !r.bloqueado && !r.ganhou).length}L`}
+        >
+          <div className="h-[200px]">
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={entradaTimeline} margin={{ left: -20, right: 4 }}>
+                <CartesianGrid stroke={C.grid} vertical={false} />
+                <XAxis dataKey="i" hide />
+                <YAxis stroke={C.axis} fontSize={10} tickFormatter={v => v === 1 ? 'Win' : v === -1 ? 'Loss' : ''} domain={[-1.5, 1.5]} ticks={[-1, 1]} />
+                <ReferenceLine y={0} stroke="rgba(255,255,255,0.1)" />
+                <Tooltip
+                  {...TT}
+                  content={({ active, payload }) => {
+                    if (!active || !payload?.length) return null
+                    const d = payload[0].payload
+                    return (
+                      <div style={TT.contentStyle} className="p-2 space-y-1 text-xs">
+                        <p style={{ color: d.resultado === 1 ? C.green : '#ef4444' }}>
+                          {d.resultado === 1 ? '✅ WIN' : '❌ LOSS'}
+                        </p>
+                        <p style={{ color: C[d.cor as keyof typeof C] }}>
+                          Saiu: {d.entrada}x ({d.cor})
+                        </p>
+                        {d.mercadoBom && <p style={{ color: C.green }}>Mercado estava bom</p>}
+                      </div>
+                    )
+                  }}
+                />
+                <Bar dataKey="resultado" radius={[4, 4, 0, 0]} name="Resultado">
+                  {entradaTimeline.map((d, i) => (
+                    <Cell
+                      key={i}
+                      fill={d.resultado === 1 ? C.green : '#ef4444'}
+                      fillOpacity={d.mercadoBom ? 0.9 : 0.45}
+                    />
                   ))}
                 </Bar>
               </BarChart>
-            </div>
-          )}
-        </ChartCard>
-
-        {/* ── Correlação ── */}
-        <ChartCard
-          title="Correlação: Vela Anterior × Atual"
-          subtitle="Cada ponto é uma vela. Padrões indicam dependência entre rodadas"
-          icon={Target}
-          span={2}
-        >
-          <div className="h-[260px]">
-            <ScatterChart
-              width={fullWidth}
-              height={260}
-              margin={{ left: -10, right: 10 }}
-            >
-              <CartesianGrid stroke={C.grid} />
-              <XAxis
-                dataKey="anterior"
-                name="Anterior"
-                stroke={C.axis}
-                fontSize={10}
-                tickFormatter={v => `${v}x`}
-                domain={[0, 'auto']}
-                label={{ value: 'Vela anterior (x)', position: 'insideBottom', offset: -2, fill: C.axis, fontSize: 10 }}
-              />
-              <YAxis
-                dataKey="atual"
-                name="Atual"
-                stroke={C.axis}
-                fontSize={10}
-                tickFormatter={v => `${v}x`}
-                label={{ value: 'Vela atual (x)', angle: -90, position: 'insideLeft', fill: C.axis, fontSize: 10, dx: 20 }}
-              />
-              <ZAxis range={[18, 18]} />
-              <Tooltip
-                {...TOOLTIP_STYLE}
-                cursor={{ strokeDasharray: '3 3', stroke: 'rgba(255,255,255,0.1)' }}
-                content={({ active, payload }) => {
-                  if (!active || !payload?.length) return null
-                  const d = payload[0].payload
-                  return (
-                    <div style={TOOLTIP_STYLE.contentStyle} className="p-2 text-xs">
-                      <p style={{ color: corColor(d.cor) }}>Anterior: {d.anterior.toFixed(2)}x</p>
-                      <p style={{ color: corColor(d.cor) }}>Atual: {d.atual.toFixed(2)}x</p>
-                    </div>
-                  )
-                }}
-              />
-              {(['blue', 'purple', 'pink'] as const).map(cor => (
-                <Scatter
-                  key={cor}
-                  data={correlacao.filter(d => d.cor === cor).slice(-150)}
-                  fill={corColor(cor)}
-                  fillOpacity={0.55}
-                  name={cor === 'blue' ? 'Azul' : cor === 'purple' ? 'Roxa' : 'Rosa'}
-                  shape={<CustomDot />}
-                />
-              ))}
-              <Legend
-                formatter={v => (
-                  <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.5)' }}>{v}</span>
-                )}
-              />
-            </ScatterChart>
+            </ResponsiveContainer>
           </div>
-        </ChartCard>
+          <p className="text-[11px] text-white/30">
+            Barras opacas = entrada fora do filtro "mercado bom"
+          </p>
+        </Card>
 
-        {/* ── Distribuição de sequências ── */}
-        <ChartCard
-          title="Distribuição de Sequências por Cor"
-          subtitle="Com que frequência cada cor forma sequências de N rodadas"
-          icon={BarChart2}
-          span={2}
-        >
-          <div className="grid grid-cols-3 gap-3">
-            {([
-              { cor: 'blue',   label: 'Azul',  data: runLength.blue },
-              { cor: 'purple', label: 'Roxa',  data: runLength.purple },
-              { cor: 'pink',   label: 'Rosa',  data: runLength.pink },
-            ] as const).map(({ cor, label, data }) => (
-              <div key={cor}>
-                <p className="text-[11px] font-semibold mb-2" style={{ color: corColor(cor) }}>
-                  {label}
-                </p>
-                <div className="h-[160px]">
-                  <BarChart
-                    width={Math.floor((fullWidth - 24) / 3)}
-                    height={160}
-                    data={data}
-                    margin={{ left: -28, right: 4 }}
-                  >
-                    <CartesianGrid stroke={C.grid} vertical={false} />
-                    <XAxis dataKey="tamanho" stroke={C.axis} fontSize={9} tickFormatter={v => `${v}x`} />
-                    <YAxis stroke={C.axis} fontSize={9} />
-                    <Tooltip
-                      {...TOOLTIP_STYLE}
-                      formatter={(v: any, _, p) => [`${v}×`, `Seq. ${p.payload.tamanho} seguidas`]}
-                    />
-                    <Bar dataKey="frequencia" fill={corColor(cor)} fillOpacity={0.75} radius={[3,3,0,0]} />
-                  </BarChart>
-                </div>
-              </div>
-            ))}
-          </div>
-        </ChartCard>
-
-        {/* ── Radar ── */}
-        <ChartCard
-          title="Perfil da Sessão"
-          subtitle="Visão radar das métricas relativas da sessão atual"
-          icon={Activity}
-        >
-          <div className="h-[220px]">
-            <RadarChart
-              width={colWidth}
-              height={220}
-              data={radarData}
-              margin={{ top: 10, right: 20, bottom: 10, left: 20 }}
-            >
-              <PolarGrid stroke={C.grid} />
-              <PolarAngleAxis
-                dataKey="metrica"
-                tick={{ fill: 'rgba(255,255,255,0.45)', fontSize: 10 }}
-              />
-              <Radar
-                dataKey="valor"
-                stroke={C.blue}
-                fill={C.blue}
-                fillOpacity={0.15}
-                strokeWidth={2}
-              />
-            </RadarChart>
-          </div>
-        </ChartCard>
-
-        {/* ── Volume por horário ── */}
-        <ChartCard
-          title="Volume por Horário (Azul / Roxa / Rosa)"
-          subtitle="Composição de cores em cada hora do dia"
-          icon={Clock}
-        >
-          {heatmap.length < 2 ? (
-            <div className="h-[220px] flex items-center justify-center text-white/25 text-xs">
-              Dados insuficientes por horário...
+        {/* ── Taxa por hora ── */}
+        {taxaPorHora.length >= 2 && (
+          <Card
+            title="Melhores Horários para Entrar"
+            subtitle="Taxa de acerto da estratégia por hora do dia (mercado bom)"
+            icon={Target}
+          >
+            <div className="h-[200px]">
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={taxaPorHora} margin={{ left: -20, right: 4 }}>
+                  <CartesianGrid stroke={C.grid} vertical={false} />
+                  <XAxis dataKey="hora" stroke={C.axis} fontSize={10} />
+                  <YAxis stroke={C.axis} fontSize={10} tickFormatter={v => `${v}%`} domain={[0, 100]} />
+                  <ReferenceLine y={50} stroke="rgba(255,255,255,0.15)" strokeDasharray="3 3" />
+                  <Tooltip
+                    {...TT}
+                    formatter={(v: any, _, p) => [`${v}% (${p.payload.total} entradas)`, 'Taxa']}
+                  />
+                  <Bar dataKey="taxa" radius={[5, 5, 0, 0]} name="Taxa">
+                    {taxaPorHora.map((d, i) => (
+                      <Cell
+                        key={i}
+                        fill={d.taxa >= 60 ? C.green : d.taxa >= 40 ? C.purple : '#ef4444'}
+                        fillOpacity={0.8}
+                      />
+                    ))}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
             </div>
-          ) : (
-            <div className="h-[220px]">
-              <BarChart
-                width={colWidth}
-                height={220}
-                data={heatmap}
-                margin={{ left: -20, right: 4 }}
-              >
-                <CartesianGrid stroke={C.grid} vertical={false} />
-                <XAxis dataKey="hora" stroke={C.axis} fontSize={10} />
-                <YAxis stroke={C.axis} fontSize={10} />
-                <Tooltip {...TOOLTIP_STYLE} />
-                <Bar dataKey="azul" stackId="a" fill={C.blue}   fillOpacity={0.8} name="Azul"  radius={[0,0,0,0]} />
-                <Bar dataKey="roxa" stackId="a" fill={C.purple} fillOpacity={0.8} name="Roxa" />
-                <Bar dataKey="rosa" stackId="a" fill={C.pink}   fillOpacity={0.8} name="Rosa"  radius={[4,4,0,0]} />
-              </BarChart>
-            </div>
-          )}
-        </ChartCard>
+            <p className="text-[11px] text-white/30">
+              Verde = acima de 60% · Roxo = neutro · Vermelho = evitar
+            </p>
+          </Card>
+        )}
 
       </div>
     </div>
