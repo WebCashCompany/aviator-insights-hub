@@ -42,7 +42,7 @@ function ssGet<T>(key: string, fallback: T): T {
 function ssSet(key: string, value: unknown): void { try { sessionStorage.setItem(key, JSON.stringify(value)) } catch {} }
 
 // ─── MERCADO PAGANDO ──────────────────────────────────────────────────────────
-const MARKET_PAYING_THRESHOLD = 0.47   // < 47% azuis = pagando
+const MARKET_PAYING_THRESHOLD = 0.475  // < 47.5% azuis = pagando ✅
 const MARKET_WINDOW           = 80
 const MARKET_ALERT_COOLDOWN   = 10 * 60 * 1000
 
@@ -111,14 +111,9 @@ function buildStrategies(config: Record<string, string>): StrategyDef[] {
     },
 
     // ── 2. Sequência da Vela Roxa ─────────────────────────────────────────────
-    // LÓGICA:
-    //   1. Mercado pagando (< 47% azuis nas últimas 80 velas)
-    //   2. Chegam 2, 3 ou 4 velas AZUIS consecutivas
-    //   3. Vem 1 vela ROXA → sinal "entrar" (entramos NA PRÓXIMA vela, após a roxa)
-    //   4. Qualquer outro padrão = aguardar ou bloqueado
     {
       id: 's_roxa_azul50', name: 'Sequência da Vela Roxa',
-      description: 'Entrada na vela após roxa precedida de 2–4 azuis consecutivas. Mercado pagando (< 47% azuis / 80 velas).',
+      description: 'Entrada na vela após roxa precedida de 2–4 azuis consecutivas. Mercado pagando (< 47.5% azuis / 80 velas).',
       icon: <Zap className="h-4 w-4" />,
       detectSignal(candles) {
         if (candles.length < 5) return null
@@ -128,7 +123,7 @@ function buildStrategies(config: Record<string, string>): StrategyDef[] {
         if (bluePct >= MARKET_PAYING_THRESHOLD)
           return {
             tipo: 'bloqueado',
-            msg:  `Mercado não pagando: ${(bluePct * 100).toFixed(0)}% azuis (precisa < ${MARKET_PAYING_THRESHOLD * 100}%)`,
+            msg:  `Mercado não pagando: ${(bluePct * 100).toFixed(1)}% azuis (precisa < ${MARKET_PAYING_THRESHOLD * 100}%)`,
             color: C.amber,
           }
 
@@ -149,7 +144,6 @@ function buildStrategies(config: Record<string, string>): StrategyDef[] {
               color: C.green,
             }
 
-          // Roxa veio mas sequência inválida
           return {
             tipo: 'bloqueado',
             msg:  streak < 2
@@ -246,8 +240,8 @@ function MarketPayingBanner({ candles }: { candles: Candle[] }) {
       />
       <p className="text-xs font-medium" style={{ color: paying ? C.green : 'rgba(255,255,255,0.4)' }}>
         {paying
-          ? `Mercado pagando — ${(pct * 100).toFixed(0)}% azuis nas últimas ${MARKET_WINDOW} velas`
-          : `Mercado NÃO pagando — ${(pct * 100).toFixed(0)}% azuis (precisa < ${MARKET_PAYING_THRESHOLD * 100}%)`}
+          ? `Mercado pagando — ${(pct * 100).toFixed(1)}% azuis nas últimas ${MARKET_WINDOW} velas`
+          : `Mercado NÃO pagando — ${(pct * 100).toFixed(1)}% azuis (precisa < ${MARKET_PAYING_THRESHOLD * 100}%)`}
       </p>
       {!paying && <WifiOff className="h-3.5 w-3.5 ml-auto shrink-0" style={{ color: C.amber }} />}
     </div>
@@ -339,7 +333,6 @@ export default function StrategiesPage() {
 
   const tradeRef        = useRef<TradeState>({ phase: 'idle', entryCandles: 0, stratName: '' })
   const prevSignalRef   = useRef<'entrar' | 'aguardar' | 'bloqueado' | null>(null)
-  // FIX: começa em -1 → garante que roda na primeira renderização com candles já carregados
   const lastCandleCount = useRef<number>(-1)
   const lastPayAlertAt  = useRef<number>(0)
 
@@ -352,7 +345,6 @@ export default function StrategiesPage() {
 
   const [tradeDisplay, setTradeDisplay] = useState<TradeDisplay>({ kind: 'idle' })
 
-  // Status do servidor WPP
   useEffect(() => {
     fetch(`${API_BASE}/whatsapp/status`)
       .then(r => r.json())
@@ -382,7 +374,6 @@ export default function StrategiesPage() {
     return valid.sort((a, b) => b[1].winRate - a[1].winRate)[0][0]
   }, [allStats])
 
-  // FIX: apiPostMarket — sem depender de estratégia selecionada
   const apiPostMarket = useCallback(async (endpoint: string, body: object) => {
     if (!wppConfig.enabled || !wppConfig.serverConfigured || !wppConfig.targets.length) return
     try {
@@ -394,7 +385,6 @@ export default function StrategiesPage() {
     } catch {}
   }, [wppConfig.enabled, wppConfig.serverConfigured, wppConfig.targets, updateWppConfig])
 
-  // FIX: apiPost — removido !selectedId do guard (causava bloqueio dos sinais)
   const apiPost = useCallback(async (endpoint: string, body: object) => {
     if (!wppConfig.enabled || !wppConfig.serverConfigured || !wppConfig.targets.length) return
     try {
@@ -412,7 +402,6 @@ export default function StrategiesPage() {
     if (candles.length === lastCandleCount.current) return
     lastCandleCount.current = candles.length
 
-    // Alerta de mercado (independente de estratégia)
     const pct     = bluePercent(candles, MARKET_WINDOW)
     const paying  = pct < MARKET_PAYING_THRESHOLD
     const elapsed = Date.now() - lastPayAlertAt.current
@@ -422,7 +411,6 @@ export default function StrategiesPage() {
       apiPostMarket('/whatsapp/market-paying', {})
     }
 
-    // Sinais de estratégia
     if (!selected) return
 
     if (!paying) {
@@ -439,7 +427,6 @@ export default function StrategiesPage() {
     const prevTipo = prevSignalRef.current
 
     if (trade.phase === 'idle') {
-      // Transição nova para "entrar" → pré-sinal
       if (prevTipo !== 'entrar' && tipo === 'entrar') {
         apiPost('/whatsapp/warning', { strategyName: selected.name })
         tradeRef.current = { phase: 'warning_sent', entryCandles: candles.length, stratName: selected.name }
@@ -447,7 +434,6 @@ export default function StrategiesPage() {
       }
 
     } else if (trade.phase === 'warning_sent') {
-      // Nova vela chegou após o pré-sinal → confirma entrada (é a vela após a roxa)
       if (candles.length > trade.entryCandles) {
         apiPost('/whatsapp/confirmed', { strategyName: selected.name })
         tradeRef.current = { ...trade, phase: 'confirmed', entryCandles: candles.length }
@@ -483,11 +469,10 @@ export default function StrategiesPage() {
     prevSignalRef.current = tipo
   }, [candles, sinalAtual, wppConfig.enabled, selected, apiPost, apiPostMarket])
 
-  // Reseta ao trocar de estratégia
   useEffect(() => {
     tradeRef.current        = { phase: 'idle', entryCandles: 0, stratName: '' }
     prevSignalRef.current   = null
-    lastCandleCount.current = -1  // FIX: -1 para rodar na primeira renderização
+    lastCandleCount.current = -1
     setTradeDisplay({ kind: 'idle' })
   }, [selectedId])
 
@@ -519,7 +504,7 @@ export default function StrategiesPage() {
           style={{ borderColor: C.amber + '40', background: C.amber + '10' }}>
           <WifiOff className="h-3.5 w-3.5 shrink-0" style={{ color: C.amber }} />
           <span className="text-xs font-medium" style={{ color: C.amber }}>
-            Sinais bloqueados — mercado não está pagando ({(bluePercent(candles, MARKET_WINDOW) * 100).toFixed(0)}% azuis)
+            Sinais bloqueados — mercado não está pagando ({(bluePercent(candles, MARKET_WINDOW) * 100).toFixed(1)}% azuis)
           </span>
         </div>
       )}
