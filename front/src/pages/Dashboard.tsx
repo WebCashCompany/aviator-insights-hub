@@ -1,5 +1,5 @@
 import { useState, useMemo } from 'react'
-import { useCandles, useSessions } from '@/hooks/useCandles'
+import { useCandles } from '@/hooks/useCandles'
 import { useWS } from '@/contexts/WebSocketContext'
 import { detectarPadroes, corParaLabel, calcularStats } from '@/utils/candleUtils'
 import {
@@ -9,10 +9,9 @@ import {
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
-import { Download, Upload, Radio, Clock, Layers } from 'lucide-react'
+import { Download, Upload } from 'lucide-react'
 import ImportModal from '@/components/ImportModal'
 import { format, isValid } from 'date-fns'
-import { ptBR } from 'date-fns/locale'
 
 const COLORS = {
   blue: 'hsl(217,91%,60%)',
@@ -26,24 +25,9 @@ export default function DashboardPage() {
   const [importOpen, setImportOpen] = useState(false)
   const ws = useWS()
 
-  const { sessions, loadingSessions } = useSessions()
-  const [selectedSessionId, setSelectedSessionId] = useState<string | null | 'LOADING'>('LOADING')
+  const { candles: dbCandles, loading } = useCandles({ limit })
 
-  const resolvedSessionId = useMemo(() => {
-    if (selectedSessionId !== 'LOADING') return selectedSessionId
-    if (loadingSessions || sessions.length === 0) return undefined
-    return sessions[0]?.id ?? null
-  }, [selectedSessionId, sessions, loadingSessions])
-
-  // Velas confirmadas no banco (Supabase Realtime)
-  const { candles: dbCandles, loading } = useCandles({
-    limit,
-    sessionId: resolvedSessionId === undefined ? undefined : resolvedSessionId,
-  })
-
-  // Mescla banco + WebSocket e deduplica.
-  // Chave de dedup: multiplicador + bucket de 3s (cobre pequenas diferenças de timestamp
-  // entre o momento em que o WS emite e o created_at gravado no banco).
+  // Mescla banco + WebSocket e deduplica por multiplicador + bucket de 3s
   const candles = useMemo(() => {
     const wsCandles: any[] = Array.isArray(ws?.candles) ? ws.candles : []
 
@@ -52,19 +36,16 @@ export default function DashboardPage() {
       return `${Number(c.multiplicador).toFixed(2)}_${bucket}`
     }
 
-    // Banco tem prioridade — suas entradas ficam no Map primeiro
     const map = new Map<string, any>()
-    for (const c of dbCandles)  map.set(key(c), c)
-    for (const c of wsCandles)  { if (!map.has(key(c))) map.set(key(c), c) }
+    for (const c of dbCandles) map.set(key(c), c)
+    for (const c of wsCandles) { if (!map.has(key(c))) map.set(key(c), c) }
 
     return Array.from(map.values())
       .sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())
       .slice(-limit)
   }, [dbCandles, ws?.candles, limit])
 
-  // Stats recalculadas sobre as velas mescladas — reage instantaneamente ao WS
   const stats = useMemo(() => calcularStats(candles), [candles])
-
   const padroes = useMemo(() => detectarPadroes(candles), [candles])
 
   const chartData = useMemo(() =>
@@ -84,8 +65,8 @@ export default function DashboardPage() {
   }, [candles])
 
   const exportCSV = () => {
-    const csv = ['multiplicador,cor,fonte,sessao,data',
-      ...candles.map((c: any) => `${c.multiplicador},${c.cor},${c.fonte ?? ''},${c.session_id ?? ''},${c.created_at}`)
+    const csv = ['multiplicador,cor,fonte,data',
+      ...candles.map((c: any) => `${c.multiplicador},${c.cor},${c.fonte ?? ''},${c.created_at}`)
     ].join('\n')
     const blob = new Blob([csv], { type: 'text/csv' })
     const url = URL.createObjectURL(blob)
@@ -95,19 +76,7 @@ export default function DashboardPage() {
     a.click()
   }
 
-  const sessionLabel = useMemo(() => {
-    const id = resolvedSessionId === undefined ? null : resolvedSessionId
-    if (id === null) return 'Todas as sessões'
-    const s = sessions.find(s => s.id === id)
-    return s ? s.label : 'Sessão atual'
-  }, [resolvedSessionId, sessions])
-
-  const isCurrentSession =
-    resolvedSessionId !== undefined &&
-    resolvedSessionId !== null &&
-    sessions[0]?.id === resolvedSessionId
-
-  if (loading && resolvedSessionId === undefined) {
+  if (loading) {
     return (
       <div className="space-y-4 p-6">
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
@@ -132,56 +101,6 @@ export default function DashboardPage() {
           ))}
         </div>
 
-        {/* Seletor de sessão */}
-        <div className="flex items-center gap-1 bg-white/5 rounded-lg p-1 border border-white/10 overflow-x-auto max-w-[420px]">
-          {sessions[0] && (
-            <button
-              onClick={() => setSelectedSessionId(sessions[0].id)}
-              className={`flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md font-medium transition-all whitespace-nowrap
-                ${resolvedSessionId === sessions[0].id
-                  ? 'bg-emerald-600 text-white shadow-lg'
-                  : 'text-muted-foreground hover:text-foreground'}`}
-            >
-              <Radio className="h-3 w-3" />
-              Atual
-              {resolvedSessionId === sessions[0].id && (
-                <span className="relative flex h-2 w-2">
-                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-300 opacity-75" />
-                  <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-400" />
-                </span>
-              )}
-            </button>
-          )}
-
-          {sessions.slice(1).map((s) => (
-            <button
-              key={s.id}
-              onClick={() => setSelectedSessionId(s.id)}
-              title={s.label}
-              className={`flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md font-medium transition-all whitespace-nowrap
-                ${resolvedSessionId === s.id
-                  ? 'bg-blue-600 text-white shadow-lg'
-                  : 'text-muted-foreground hover:text-foreground'}`}
-            >
-              <Clock className="h-3 w-3" />
-              {isValid(new Date(s.started_at))
-                ? format(new Date(s.started_at), "dd/MM HH'h'mm", { locale: ptBR })
-                : s.label}
-            </button>
-          ))}
-
-          <button
-            onClick={() => setSelectedSessionId(null)}
-            className={`flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md font-medium transition-all whitespace-nowrap
-              ${resolvedSessionId === null
-                ? 'bg-purple-600 text-white shadow-lg'
-                : 'text-muted-foreground hover:text-foreground'}`}
-          >
-            <Layers className="h-3 w-3" />
-            Todas
-          </button>
-        </div>
-
         <div className="flex-1" />
 
         <div className="flex gap-2">
@@ -192,29 +111,6 @@ export default function DashboardPage() {
             <Download className="h-4 w-4 mr-2" /> Exportar
           </Button>
         </div>
-      </div>
-
-      {/* Label da sessão ativa */}
-      <div className="flex items-center gap-2 text-xs text-muted-foreground">
-        {isCurrentSession && (
-          <span className="flex items-center gap-1 text-emerald-400 font-medium">
-            <span className="relative flex h-2 w-2">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-300 opacity-75" />
-              <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-400" />
-            </span>
-            ao vivo
-          </span>
-        )}
-        <span>{sessionLabel}</span>
-        {resolvedSessionId && (() => {
-          const s = sessions.find(s => s.id === resolvedSessionId)
-          return s && isValid(new Date(s.started_at))
-            ? <>
-                <span className="text-white/30">·</span>
-                <span>iniciada em {format(new Date(s.started_at), "dd/MM/yyyy 'às' HH:mm", { locale: ptBR })}</span>
-              </>
-            : null
-        })()}
       </div>
 
       {/* ── Métricas ── */}

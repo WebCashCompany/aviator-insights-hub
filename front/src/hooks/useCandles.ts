@@ -4,59 +4,11 @@ import { useAuth } from '@/contexts/AuthContext'
 import { Candle } from '@/types'
 import { calcularCor, calcularStats } from '@/utils/candleUtils'
 
-export interface Session {
-  id: string
-  label: string
-  started_at: string
-}
-
 interface UseCandlesOptions {
   limit?: number
   cor?: string
   from?: string
   to?: string
-  sessionId?: string | null   // null = todas as sessões, string = sessão específica
-}
-
-export function useSessions() {
-  const { user } = useAuth()
-  const [sessions, setSessions] = useState<Session[]>([])
-  const [loadingSessions, setLoadingSessions] = useState(true)
-
-  const fetchSessions = useCallback(async () => {
-    if (!user) return
-    setLoadingSessions(true)
-
-    const { data, error } = await supabase
-      .from('sessions')
-      .select('id, label, started_at')
-      .eq('user_id', user.id)
-      .order('started_at', { ascending: false })
-
-    if (!error && data) setSessions(data as Session[])
-    setLoadingSessions(false)
-  }, [user])
-
-  useEffect(() => { fetchSessions() }, [fetchSessions])
-
-  // Escuta sessões novas em tempo real (bot ligou de novo)
-  useEffect(() => {
-    if (!user) return
-    const channel = supabase
-      .channel(`sessions-realtime-${user.id}-${Date.now()}`)
-      .on(
-        'postgres_changes',
-        { event: 'INSERT', schema: 'public', table: 'sessions', filter: `user_id=eq.${user.id}` },
-        (payload) => {
-          setSessions(prev => [payload.new as Session, ...prev])
-        }
-      )
-      .subscribe()
-
-    return () => { supabase.removeChannel(channel) }
-  }, [user])
-
-  return { sessions, loadingSessions, refetchSessions: fetchSessions }
 }
 
 export function useCandles(options: UseCandlesOptions = {}) {
@@ -76,48 +28,38 @@ export function useCandles(options: UseCandlesOptions = {}) {
       .eq('user_id', user.id)
       .order('created_at', { ascending: true })
 
-    if (options.limit)     query = query.limit(options.limit)
-    if (options.cor)       query = query.eq('cor', options.cor)
-    if (options.from)      query = query.gte('created_at', options.from)
-    if (options.to)        query = query.lte('created_at', options.to)
-    // Filtra por sessão apenas se sessionId for uma string não-vazia
-    // Passa null para ver todas as sessões sem filtro
-    if (options.sessionId) query = query.eq('session_id', options.sessionId)
+    if (options.limit) query = query.limit(options.limit)
+    if (options.cor)   query = query.eq('cor', options.cor)
+    if (options.from)  query = query.gte('created_at', options.from)
+    if (options.to)    query = query.lte('created_at', options.to)
 
     const { data, error } = await query
     if (!error && data) setDbCandles(data as Candle[])
     setLoading(false)
-  }, [user, options.limit, options.cor, options.from, options.to, options.sessionId])
+  }, [user, options.limit, options.cor, options.from, options.to])
 
   useEffect(() => { fetchCandles() }, [fetchCandles])
 
-  // Realtime: escuta INSERT com channel gerenciado por ref para evitar subscribe duplo
-  const channelRef = useRef<ReturnType<typeof supabase.channel> | null>(null)
-  const sessionIdRef = useRef(options.sessionId)
-  sessionIdRef.current = options.sessionId
-
+  // Realtime: .on() DEVE ser chamado antes de .subscribe()
+  // O cleanup remove o canal completamente antes de recriar
   useEffect(() => {
     if (!user) return
 
-    // Remove channel anterior antes de criar um novo
-    if (channelRef.current) {
-      supabase.removeChannel(channelRef.current)
-      channelRef.current = null
-    }
+    const channelName = `candles-${user.id}-${Date.now()}`
 
-    const channelName = `candles-realtime-${user.id}-${Date.now()}`
-
-    channelRef.current = supabase
+    // Constrói o canal com o listener JÁ registrado, depois subscreve
+    const channel = supabase
       .channel(channelName)
       .on(
         'postgres_changes',
-        { event: 'INSERT', schema: 'public', table: 'candles', filter: `user_id=eq.${user.id}` },
+        {
+          event: 'INSERT',
+          schema: 'public',
+          table: 'candles',
+          filter: `user_id=eq.${user.id}`,
+        },
         (payload) => {
           const newCandle = payload.new as Candle
-
-          // Le sessionId do ref para sempre ter valor atual sem recriar o channel
-          if (sessionIdRef.current && newCandle.session_id !== sessionIdRef.current) return
-
           setDbCandles(prev => {
             if (prev.some(c => c.id === newCandle.id)) return prev
             const next = [...prev, newCandle].sort(
@@ -130,13 +72,11 @@ export function useCandles(options: UseCandlesOptions = {}) {
       )
       .subscribe()
 
+    // Cleanup: remove o canal inteiro — nunca reutiliza após unsubscribe
     return () => {
-      if (channelRef.current) {
-        supabase.removeChannel(channelRef.current)
-        channelRef.current = null
-      }
+      supabase.removeChannel(channel)
     }
-  }, [user]) // so recria o channel quando o usuario muda; sessionId e lido via ref
+  }, [user])
 
   const addCandle = useCallback(async (multiplicador: number, fonte: 'manual' | 'csv' | 'auto' = 'manual') => {
     if (!user) return
@@ -146,8 +86,6 @@ export function useCandles(options: UseCandlesOptions = {}) {
       multiplicador,
       cor,
       fonte,
-      // Inserções manuais não pertencem a nenhuma sessão do bot
-      session_id: null,
     }).select().single()
     return { data, error }
   }, [user])
@@ -159,7 +97,6 @@ export function useCandles(options: UseCandlesOptions = {}) {
       multiplicador: m,
       cor: calcularCor(m),
       fonte,
-      session_id: null,
     }))
     const { data, error } = await supabase.from('candles').insert(rows).select()
     return { data, error }

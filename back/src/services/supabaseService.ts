@@ -9,9 +9,7 @@ const supabase = createClient(
 )
 
 let resolvedUserId: string | null = null
-let currentSessionId: string | null = null
 
-// Chame isso UMA vez no startup
 export async function initBotUser(): Promise<void> {
   const email = process.env.BET923_EMAIL
 
@@ -32,49 +30,34 @@ export async function initBotUser(): Promise<void> {
 
     if (!user) {
       logger.error(`❌ Nenhum usuário encontrado com email: ${email}`)
-      logger.error('   Certifique-se que esse email está cadastrado no Supabase Auth')
       return
     }
 
     resolvedUserId = user.id
     logger.info(`✅ Bot vinculado ao usuário: ${email} (user_id: ${resolvedUserId})`)
 
-    // Cria a sessão logo após resolver o usuário
-    await initSession()
+    // Limpa todas as velas do banco ao iniciar
+    await clearCandles()
   } catch (err: any) {
     logger.error(`💥 Erro crítico ao buscar usuário: ${err.message}`)
   }
 }
 
-// Cria uma nova sessão no banco e armazena o ID localmente
-async function initSession(): Promise<void> {
+async function clearCandles(): Promise<void> {
   if (!resolvedUserId) return
-
   try {
-    const { data, error } = await supabase
-      .from('sessions')
-      .insert({
-        user_id: resolvedUserId,
-        started_at: new Date().toISOString(),
-        label: `Sessão ${new Date().toLocaleString('pt-BR', {
-          day: '2-digit',
-          month: '2-digit',
-          hour: '2-digit',
-          minute: '2-digit',
-        })}`,
-      })
-      .select('id')
-      .single()
+    const { error, count } = await supabase
+      .from('candles')
+      .delete({ count: 'exact' })
+      .eq('user_id', resolvedUserId)
 
     if (error) {
-      logger.error(`❌ Erro ao criar sessão: ${error.message}`)
-      return
+      logger.error(`❌ Erro ao limpar velas: ${error.message}`)
+    } else {
+      logger.info(`🧹 Banco limpo: ${count ?? 0} vela(s) removida(s)`)
     }
-
-    currentSessionId = data.id
-    logger.info(`🆕 Sessão iniciada: ${currentSessionId}`)
   } catch (err: any) {
-    logger.error(`💥 Falha ao criar sessão: ${err.message}`)
+    logger.error(`💥 Falha ao limpar banco: ${err.message}`)
   }
 }
 
@@ -84,15 +67,9 @@ export async function saveCandle(candle: Candle): Promise<void> {
     return
   }
 
-  if (!currentSessionId) {
-    logger.warn('⚠️  session_id não resolvido — vela não salva')
-    return
-  }
-
   try {
     const { error } = await supabase.from('candles').insert({
       user_id: resolvedUserId,
-      session_id: currentSessionId,   // ← campo novo
       multiplicador: candle.multiplicador,
       cor: candle.cor,
       rodada_id: candle.rodada_id,
@@ -105,13 +82,9 @@ export async function saveCandle(candle: Candle): Promise<void> {
         logger.error(`❌ Erro Supabase: ${error.message}`)
       }
     } else {
-      logger.info(`✅ Vela salva: ${candle.multiplicador}x (sessão ${currentSessionId})`)
+      logger.info(`✅ Vela salva: ${candle.multiplicador}x`)
     }
   } catch (err: any) {
     logger.error(`💥 Falha crítica ao salvar vela: ${err.message}`)
   }
-}
-
-export function getCurrentSessionId(): string | null {
-  return currentSessionId
 }

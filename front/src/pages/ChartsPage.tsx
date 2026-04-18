@@ -1,5 +1,5 @@
-import { useMemo, useState } from 'react'
-import { useCandles, useSessions } from '@/hooks/useCandles'
+import { useMemo } from 'react'
+import { useCandles } from '@/hooks/useCandles'
 import { useWS } from '@/contexts/WebSocketContext'
 import { calcularStats } from '@/utils/candleUtils'
 import {
@@ -40,11 +40,8 @@ function buildStreakHistory(candles: any[]) {
   const result: { index: number; streak: number; cor: string }[] = []
   let streak = 1
   for (let i = 1; i < candles.length; i++) {
-    if (candles[i].cor === candles[i - 1].cor) {
-      streak++
-    } else {
-      streak = 1
-    }
+    if (candles[i].cor === candles[i - 1].cor) { streak++ }
+    else { streak = 1 }
     result.push({ index: i, streak, cor: candles[i].cor })
   }
   return result
@@ -67,9 +64,9 @@ function buildIntervalRosa(candles: any[]) {
 }
 
 function buildHeatmapHora(candles: any[]) {
-  const horas: Record<number, { blue: number; purple: number; pink: number; total: number; mediaRosa: number }> = {}
+  const horas: Record<number, { blue: number; purple: number; pink: number; total: number }> = {}
   for (let h = 0; h < 24; h++) {
-    horas[h] = { blue: 0, purple: 0, pink: 0, total: 0, mediaRosa: 0 }
+    horas[h] = { blue: 0, purple: 0, pink: 0, total: 0 }
   }
   candles.forEach(c => {
     const d = new Date(c.created_at)
@@ -107,15 +104,9 @@ function buildRunLength(candles: any[]) {
   let len = 1
   for (let i = 1; i < candles.length; i++) {
     if (candles[i].cor === cur) { len++ }
-    else {
-      runs[cur].push(len)
-      cur = candles[i].cor
-      len = 1
-    }
+    else { runs[cur].push(len); cur = candles[i].cor; len = 1 }
   }
   runs[cur].push(len)
-
-  // Converte para frequência: { tamanho: 1..N, frequencia: X }
   const toFreq = (arr: number[]) => {
     const freq: Record<number, number> = {}
     arr.forEach(n => { freq[n] = (freq[n] || 0) + 1 })
@@ -131,7 +122,7 @@ function buildRadar(candles: any[]) {
   return [
     { metrica: 'Freq. Azul',  valor: Math.round(stats.blue.percent) },
     { metrica: 'Freq. Roxa',  valor: Math.round(stats.purple.percent) },
-    { metrica: 'Freq. Rosa',  valor: Math.round(stats.pink.percent * 3) }, // amplifica para visualizar
+    { metrica: 'Freq. Rosa',  valor: Math.round(stats.pink.percent * 3) },
     { metrica: 'Streak Azul', valor: max(stats.maiorStreakAzul, 20) },
     { metrica: 'Streak Roxa', valor: max(stats.maiorStreakRoxa, 20) },
     { metrica: 'Volatil.',    valor: max(stats.maior, 100) },
@@ -165,7 +156,6 @@ function ChartCard({ title, subtitle, icon: Icon, children, span = 1 }: {
   )
 }
 
-// ── Tooltip customizado ───────────────────────────────────────────────────────
 const CustomDot = (props: any) => {
   const { cx, cy, payload } = props
   return <circle cx={cx} cy={cy} r={3} fill={corColor(payload.cor)} fillOpacity={0.8} stroke="none" />
@@ -174,17 +164,8 @@ const CustomDot = (props: any) => {
 // ── Página Principal ──────────────────────────────────────────────────────────
 export default function ChartsPage() {
   const ws = useWS()
-  const { sessions, loadingSessions } = useSessions()
 
-  const resolvedSessionId = useMemo(() => {
-    if (loadingSessions || sessions.length === 0) return undefined
-    return sessions[0]?.id ?? null
-  }, [sessions, loadingSessions])
-
-  const { candles: dbCandles } = useCandles({
-    limit: 500,
-    sessionId: resolvedSessionId,
-  })
+  const { candles: dbCandles } = useCandles({ limit: 500 })
 
   // Mescla WS + banco (mesmo padrão do Dashboard)
   const candles = useMemo(() => {
@@ -202,7 +183,6 @@ export default function ChartsPage() {
 
   const stats = useMemo(() => calcularStats(candles), [candles])
 
-  // ── Dados dos gráficos ────────────────────────────────────────────────────
   const multSerie = useMemo(() =>
     candles.map((c, i) => ({ i: i + 1, v: Number(c.multiplicador), cor: c.cor })),
     [candles]
@@ -254,7 +234,6 @@ export default function ChartsPage() {
 
   return (
     <div className="p-4 pb-24 lg:pb-6 space-y-4">
-      {/* Header */}
       <div className="flex items-center justify-between mb-2">
         <div>
           <h1 className="text-lg font-bold text-white">Análise Gráfica</h1>
@@ -271,10 +250,8 @@ export default function ChartsPage() {
         )}
       </div>
 
-      {/* Grid de gráficos */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
 
-        {/* 1. Série temporal de multiplicadores + média móvel */}
         <ChartCard
           title="Multiplicadores ao Longo do Tempo"
           subtitle={`Média móvel 10 períodos · pico ${stats?.maior?.toFixed(2)}x`}
@@ -296,14 +273,13 @@ export default function ChartsPage() {
                 <Tooltip {...TOOLTIP_STYLE} formatter={(v: any) => [`${Number(v).toFixed(2)}x`]} />
                 <ReferenceLine y={2}  stroke={C.purple} strokeDasharray="3 3" strokeOpacity={0.5} />
                 <ReferenceLine y={10} stroke={C.pink}   strokeDasharray="3 3" strokeOpacity={0.5} />
-                <Area dataKey="v"  stroke={C.blue}   fill="url(#gMult)" strokeWidth={1.5} dot={false} name="Multiplicador" />
-                <Line dataKey="ma" stroke={C.pink}   strokeWidth={2}    dot={false} strokeDasharray="4 2" name="Média 10p" connectNulls />
+                <Area dataKey="v"  stroke={C.blue} fill="url(#gMult)" strokeWidth={1.5} dot={false} name="Multiplicador" />
+                <Line dataKey="ma" stroke={C.pink} strokeWidth={2}    dot={false} strokeDasharray="4 2" name="Média 10p" connectNulls />
               </AreaChart>
             </ResponsiveContainer>
           </div>
         </ChartCard>
 
-        {/* 2. Distribuição de multiplicadores por faixa */}
         <ChartCard
           title="Distribuição por Faixa"
           subtitle="Quantas velas caíram em cada faixa de multiplicador"
@@ -324,7 +300,6 @@ export default function ChartsPage() {
           </div>
         </ChartCard>
 
-        {/* 3. Histórico de streak (sequência atual a cada vela) */}
         <ChartCard
           title="Comprimento de Streak por Vela"
           subtitle="Tamanho da sequência consecutiva em cada ponto"
@@ -345,7 +320,6 @@ export default function ChartsPage() {
           </div>
         </ChartCard>
 
-        {/* 4. Intervalo entre Rosas (10x+) */}
         <ChartCard
           title="Intervalo Entre Rosas (10x+)"
           subtitle="Quantas velas entre cada aparição Rosa"
@@ -374,7 +348,6 @@ export default function ChartsPage() {
           )}
         </ChartCard>
 
-        {/* 5. Heatmap de % Rosa por hora */}
         <ChartCard
           title="% Rosa por Horário"
           subtitle="Em quais horas Rosa (10x+) aparece mais"
@@ -410,10 +383,7 @@ export default function ChartsPage() {
                   />
                   <Bar dataKey="pctRosa" radius={[4,4,0,0]} name="% Rosa">
                     {heatmap.map((d, i) => (
-                      <Cell key={i}
-                        fill={C.pink}
-                        fillOpacity={0.15 + (d.pctRosa / 100) * 0.85}
-                      />
+                      <Cell key={i} fill={C.pink} fillOpacity={0.15 + (d.pctRosa / 100) * 0.85} />
                     ))}
                   </Bar>
                 </BarChart>
@@ -422,7 +392,6 @@ export default function ChartsPage() {
           )}
         </ChartCard>
 
-        {/* 6. Correlação vela anterior × vela atual (scatter) */}
         <ChartCard
           title="Correlação: Vela Anterior × Atual"
           subtitle="Cada ponto é uma vela. Padrões indicam dependência entre rodadas"
@@ -466,15 +435,12 @@ export default function ChartsPage() {
                     shape={<CustomDot />}
                   />
                 ))}
-                <Legend
-                  formatter={(v) => <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.5)' }}>{v}</span>}
-                />
+                <Legend formatter={(v) => <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.5)' }}>{v}</span>} />
               </ScatterChart>
             </ResponsiveContainer>
           </div>
         </ChartCard>
 
-        {/* 7. Frequência de comprimento de sequência por cor */}
         <ChartCard
           title="Distribuição de Sequências por Cor"
           subtitle="Com que frequência cada cor forma sequências de N rodadas"
@@ -505,7 +471,6 @@ export default function ChartsPage() {
           </div>
         </ChartCard>
 
-        {/* 8. Radar de perfil da sessão */}
         <ChartCard
           title="Perfil da Sessão"
           subtitle="Visão radar das métricas relativas da sessão atual"
@@ -522,7 +487,6 @@ export default function ChartsPage() {
           </div>
         </ChartCard>
 
-        {/* 9. Distribuição empilhada por horário */}
         <ChartCard
           title="Volume por Horário (Azul / Roxa / Rosa)"
           subtitle="Composição de cores em cada hora do dia"
