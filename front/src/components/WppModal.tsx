@@ -1,11 +1,5 @@
 /**
  * WppModal.tsx — adaptado para Baileys (sem Evolution API)
- *
- * Mudanças em relação à versão anterior:
- *  - /instance/connect agora retorna { state, qr } diretamente do Baileys
- *  - Polling de estado usa /instance/state (igual)
- *  - Sem referências a Evolution, Docker ou EVO_INSTANCE
- *  - QR é um data-URL direto (gerado pelo qrcode no backend)
  */
 
 import { useState, useEffect, useCallback, useRef } from 'react'
@@ -15,6 +9,21 @@ import {
 } from 'lucide-react'
 
 const API = import.meta.env.VITE_BOT_API_URL || 'http://localhost:3001/api/v1'
+
+// Header necessário para o ngrok não bloquear as requisições
+const NGROK_HEADERS: HeadersInit = API.includes('ngrok')
+  ? { 'ngrok-skip-browser-warning': 'true' }
+  : {}
+
+function apiFetch(url: string, options: RequestInit = {}): Promise<Response> {
+  return fetch(url, {
+    ...options,
+    headers: {
+      ...NGROK_HEADERS,
+      ...(options.headers ?? {}),
+    },
+  })
+}
 
 const C = {
   green:  'hsl(142,71%,45%)',
@@ -63,7 +72,7 @@ export default function WppModal({ onClose, onTargetsChange, initialTargets }: P
   // ── Verifica estado ──────────────────────────────────────────────────────────
   const checkState = useCallback(async (): Promise<ConnState> => {
     try {
-      const r = await fetch(`${API}/whatsapp/instance/state`)
+      const r = await apiFetch(`${API}/whatsapp/instance/state`)
       const d = await r.json()
       const s = (d.state ?? 'close') as ConnState
       setConnState(s)
@@ -78,8 +87,8 @@ export default function WppModal({ onClose, onTargetsChange, initialTargets }: P
   const loadTargets = useCallback(async () => {
     try {
       const [gRes, cRes] = await Promise.all([
-        fetch(`${API}/whatsapp/groups`),
-        fetch(`${API}/whatsapp/contacts`),
+        apiFetch(`${API}/whatsapp/groups`),
+        apiFetch(`${API}/whatsapp/contacts`),
       ])
       const gData = await gRes.json()
       const cData = await cRes.json()
@@ -98,8 +107,7 @@ export default function WppModal({ onClose, onTargetsChange, initialTargets }: P
     clearTimeout(qrTimer.current!)
 
     try {
-      // O backend inicia o socket Baileys e retorna o QR gerado
-      const r = await fetch(`${API}/whatsapp/instance/connect`, { method: 'POST' })
+      const r = await apiFetch(`${API}/whatsapp/instance/connect`, { method: 'POST' })
       const d = await r.json()
 
       if (d.state === 'open') {
@@ -109,22 +117,17 @@ export default function WppModal({ onClose, onTargetsChange, initialTargets }: P
         return
       }
 
-      // state === 'connecting' — QR disponível (ou ainda sendo gerado)
       if (d.qr) {
         setQrBase64(d.qr)
         setStep('qr')
         setConnState('connecting')
-
-        // QR expira em 60s
         qrTimer.current = setTimeout(() => setQrExpired(true), 60_000)
       } else {
-        // Backend ainda gerando QR — polling rápido até obter
         setStep('qr')
         setConnState('connecting')
         qrTimer.current = setTimeout(() => setQrExpired(true), 60_000)
       }
 
-      // Polling a cada 3s: verifica estado e tenta pegar QR atualizado
       pollRef.current = setInterval(async () => {
         const stateNow = await checkState()
 
@@ -137,10 +140,9 @@ export default function WppModal({ onClose, onTargetsChange, initialTargets }: P
           return
         }
 
-        // Ainda conectando — tenta atualizar QR se não tiver um ainda
         if (stateNow === 'connecting' && !qrBase64) {
           try {
-            const qrRes = await fetch(`${API}/whatsapp/instance/connect`, { method: 'POST' })
+            const qrRes  = await apiFetch(`${API}/whatsapp/instance/connect`, { method: 'POST' })
             const qrData = await qrRes.json()
             if (qrData.qr) {
               setQrBase64(qrData.qr)
@@ -160,8 +162,7 @@ export default function WppModal({ onClose, onTargetsChange, initialTargets }: P
   const handleDisconnect = useCallback(async () => {
     clearInterval(pollRef.current!)
     clearTimeout(qrTimer.current!)
-
-    await fetch(`${API}/whatsapp/instance/disconnect`, { method: 'POST' }).catch(() => {})
+    await apiFetch(`${API}/whatsapp/instance/disconnect`, { method: 'POST' }).catch(() => {})
     setGroups([])
     setContacts([])
     setConnState('close')
@@ -200,7 +201,7 @@ export default function WppModal({ onClose, onTargetsChange, initialTargets }: P
     setSaveMsg(null)
     const targets = Array.from(selected)
     try {
-      await fetch(`${API}/whatsapp/targets`, {
+      await apiFetch(`${API}/whatsapp/targets`, {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({ targets }),
@@ -314,11 +315,7 @@ export default function WppModal({ onClose, onTargetsChange, initialTargets }: P
                 style={{ background: '#fff', boxShadow: '0 0 0 1px rgba(255,255,255,0.1)' }}
               >
                 {qrBase64 && !qrExpired ? (
-                  <img
-                    src={qrBase64}
-                    alt="QR Code"
-                    className="w-52 h-52 object-contain"
-                  />
+                  <img src={qrBase64} alt="QR Code" className="w-52 h-52 object-contain" />
                 ) : (
                   <div className="w-52 h-52 flex flex-col items-center justify-center gap-3">
                     <RefreshCw className="h-10 w-10 text-gray-300" />
@@ -358,7 +355,6 @@ export default function WppModal({ onClose, onTargetsChange, initialTargets }: P
 
           {step === 'connected' && (
             <>
-              {/* Tabs */}
               <div className="flex gap-0 border-b border-white/[0.07] px-4 pt-1">
                 {(['groups', 'contacts'] as Tab[]).map(t => (
                   <button
@@ -378,7 +374,6 @@ export default function WppModal({ onClose, onTargetsChange, initialTargets }: P
                 ))}
               </div>
 
-              {/* Busca */}
               <div className="px-4 py-3">
                 <label className="flex items-center gap-2 px-3 py-2 rounded-xl border border-white/10 bg-white/[0.04] focus-within:border-white/20 transition-colors">
                   <Search className="h-3.5 w-3.5 text-white/20 shrink-0" />
@@ -392,7 +387,6 @@ export default function WppModal({ onClose, onTargetsChange, initialTargets }: P
                 </label>
               </div>
 
-              {/* Lista */}
               <div className="px-4 pb-3 space-y-1.5">
                 {list.length === 0 && (
                   <div className="flex flex-col items-center py-10 gap-2 text-white/15">
