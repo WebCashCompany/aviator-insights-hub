@@ -427,7 +427,7 @@ export default function HistoryPage() {
                       </td>
                       <td className="px-3 py-2"><CorBadge cor={candle.cor} /></td>
                     </tr>
-                  )
+                  ) 
                 })}
               </tbody>
             </table>
