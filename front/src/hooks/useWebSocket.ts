@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { Candle, ServerStatus } from '@/types'
 
-const DEFAULT_WS_URL = 'ws://localhost:3001'
+const DEFAULT_WS_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:3001'
 
 export function useWebSocket() {
   const [candles, setCandles] = useState<Candle[]>([])
@@ -15,7 +15,11 @@ export function useWebSocket() {
   const reconnectRef = useRef<ReturnType<typeof setTimeout>>()
 
   const connect = useCallback(() => {
-    const wsUrl = localStorage.getItem('ws_url') || DEFAULT_WS_URL
+    // Usa a variável de ambiente, com fallback pro localStorage apenas em dev
+    const wsUrl = DEFAULT_WS_URL.includes('ngrok')
+      ? `${DEFAULT_WS_URL}?ngrok-skip-browser-warning=true`
+      : (localStorage.getItem('ws_url') || DEFAULT_WS_URL)
+
     try {
       const ws = new WebSocket(wsUrl)
       wsRef.current = ws
