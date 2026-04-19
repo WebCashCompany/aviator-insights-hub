@@ -21,7 +21,21 @@ const app = express()
 const server = createServer(app)
 let serverStarted = false
 
-app.use(cors({ origin: ['http://localhost:5173', 'http://localhost:3000', 'http://localhost:8080'] }))
+app.use(cors({
+  origin: [
+    'http://localhost:5173',
+    'http://localhost:3000',
+    'http://localhost:8080',
+    'https://aviatorpro.vercel.app',
+    'https://gory-survivor-entourage.ngrok-free.dev'
+  ]
+}))
+
+app.use((req, res, next) => {
+  res.setHeader('ngrok-skip-browser-warning', 'true')
+  next()
+})
+
 app.use(express.json())
 app.use('/api/v1', apiRouter)
 

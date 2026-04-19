@@ -37,7 +37,7 @@ export function useWS() {
 
 // ─── Provider ─────────────────────────────────────────────────────────────────
 
-const WS_URL = import.meta.env.VITE_BOT_WS_URL || 'ws://localhost:3001'
+const WS_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:3001'
 const MAX_CANDLES_IN_MEMORY = 1000
 const RECONNECT_DELAY_MS = 3000
 
@@ -56,7 +56,12 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
     if (wsRef.current?.readyState === WebSocket.OPEN ||
         wsRef.current?.readyState === WebSocket.CONNECTING) return
 
-    const ws = new WebSocket(WS_URL)
+    // Adiciona header ngrok para evitar tela de aviso
+    const url = WS_URL.includes('ngrok')
+      ? `${WS_URL}?ngrok-skip-browser-warning=true`
+      : WS_URL
+
+    const ws = new WebSocket(url)
     wsRef.current = ws
 
     ws.onopen = () => {
