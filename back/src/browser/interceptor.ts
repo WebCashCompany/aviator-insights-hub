@@ -6,12 +6,21 @@ import { saveCandle } from '../services/supabaseService.js'
 let GLOBAL_LAST_ROUND_ID = ''
 
 // ─── CONTROLE DE INICIALIZAÇÃO ────────────────────────────────────────────────
-// O WS pode conectar e emitir velas ANTES do histórico ser coletado.
-// Enquanto historyReady = false, as velas do WS ficam em fila e só são
-// processadas após scrapeHistory() concluir — evitando duplicatas com o histórico.
-
 let historyReady = false
 const wsQueue: Array<{ mult: number; rId: string }> = []
+
+let lastWSEmitTime = 0
+let lastKnownValue: number | null = null
+
+const DOM_FALLBACK_SILENCE_MS = 12_000
+
+// ─── PROTEÇÃO ANTI-BURST (frames sem round_id real chegando juntos) ───────────
+let lastBurstSecond = 0
+let burstCount = 0
+
+// ─── LIMITE MÁXIMO REALISTA DO AVIATOR ───────────────────────────────────────
+// O jogo raramente passa de 200x. Qualquer coisa acima é lixo binário.
+const MAX_VALID_MULTIPLIER = 200
 
 function flushWSQueue() {
   if (wsQueue.length === 0) return
@@ -26,14 +35,9 @@ export function getRawFrames() { return [] }
 export function getDetectedWSUrls() { return [] }
 
 // ─── VALIDAÇÃO CENTRAL DE MULTIPLICADOR ──────────────────────────────────────
-// Limite de 100000x cobre qualquer resultado real do Aviator.
-// O filtro principal é a checagem de casas decimais: valores vindos de leitura
-// binária corrompida tendem a ter muitas casas decimais (ex: 3.4e+38, 7.123456789).
-
 function isValidMultiplier(val: number): boolean {
   if (!isFinite(val) || isNaN(val)) return false
-  if (val < 1.00 || val > 100000) return false
-  // Rejeita valores com mais de 2 casas decimais (sinal de leitura binária suja)
+  if (val < 1.00 || val > MAX_VALID_MULTIPLIER) return false
   const rounded = Math.round(val * 100) / 100
   if (Math.abs(rounded - val) > 0.0001) return false
   return true
@@ -42,10 +46,13 @@ function isValidMultiplier(val: number): boolean {
 export async function startInterception(page: Page): Promise<void> {
   logger.info('🔍 Iniciando interceptação Híbrida FINAL...')
 
-  // Reset a cada nova sessão
   historyReady = false
   wsQueue.length = 0
   GLOBAL_LAST_ROUND_ID = ''
+  lastWSEmitTime = 0
+  lastKnownValue = null
+  lastBurstSecond = 0
+  burstCount = 0
 
   page.on('websocket', ws => {
     const url = ws.url()
@@ -66,21 +73,16 @@ export async function startInterception(page: Page): Promise<void> {
   const frame = await forceReloadGameIframe(page)
 
   if (frame) {
-    // Coleta histórico primeiro — só depois libera o WS
     await scrapeHistory(frame)
     historyReady = true
     flushWSQueue()
-
     startDOMPolling(frame)
   }
 
-  // FIX: framenavigated pode disparar durante o carregamento inicial e chamar
-  // startDOMPolling uma segunda vez no mesmo frame — a flag _isDOMPolling evita
-  // isso, mas adicionamos um guard extra verificando se o frame já está em polling.
   page.on('framenavigated', async (f) => {
     const url = f.url()
     if (!url.includes('p-j-0-h') && !url.includes('aviator')) return
-    if ((f as any)._isDOMPolling) return   // já está rodando nesse frame
+    if ((f as any)._isDOMPolling) return
     logger.info('🔄 Navegação detectada, reativando DOM polling...')
     setTimeout(() => startDOMPolling(f), 2000)
   })
@@ -101,8 +103,6 @@ async function scrapeHistory(frame: Frame) {
         const text = el.textContent?.trim() || ''
         const val = parseFloat(text.replace('x', ''))
         return (!isNaN(val) && val > 0)
-          // ID determinístico por posição — evita IDs aleatórios que inutilizavam
-          // a proteção por GLOBAL_LAST_ROUND_ID.
           ? { val, id: `hist_pos${index}_${val}` }
           : null
       }).filter(Boolean)
@@ -118,6 +118,12 @@ async function scrapeHistory(frame: Frame) {
         candleService.markEmitted(item!.val, item!.id)
         const candle = candleService.addCandle(item!.val, item!.id)
         await saveCandle(candle)
+      }
+
+      const newest = cleanHistory[cleanHistory.length - 1]
+      if (newest) {
+        lastKnownValue = newest.val
+        lastWSEmitTime = Date.now()
       }
     }
   } catch (err) {
@@ -159,7 +165,7 @@ function startDOMPolling(frame: Frame): void {
   ;(frame as any)._isDOMPolling = true
   logger.info('✅ Captura ativa! Aguardando velas...')
 
-  let lastTopValue: number | null = null
+  let lastDOMFallbackEmitted: number | null = null
 
   const interval = setInterval(async () => {
     try {
@@ -168,6 +174,8 @@ function startDOMPolling(frame: Frame): void {
         ;(frame as any)._isDOMPolling = false
         return
       }
+
+      if ((Date.now() - lastWSEmitTime) <= DOM_FALLBACK_SILENCE_MS) return
 
       const topValue = await frame.evaluate(() => {
         const selectors = '.payouts-block .payout, .stats-list .payout, .bubble-multiplier'
@@ -178,22 +186,20 @@ function startDOMPolling(frame: Frame): void {
         return (!isNaN(val) && val > 0) ? val : null
       })
 
-      if (topValue !== null && !isValidMultiplier(topValue)) {
-        logger.warn(`🚫 DOM descartado (valor inválido): ${topValue}`)
-        return
-      }
+      if (topValue === null || !isValidMultiplier(topValue)) return
+      if (topValue === lastKnownValue) return
+      if (topValue === lastDOMFallbackEmitted) return
 
-      if (topValue !== null && topValue !== lastTopValue) {
-        lastTopValue = topValue
-        const rId = `dom_${topValue}_${Date.now()}`
-        if (!candleService.isDuplicate(topValue, rId)) {
-          candleService.markEmitted(topValue, rId)
-          logger.info(`🕯️  Nova vela (DOM): ${topValue.toFixed(2)}x`)
-          const candle = candleService.addCandle(topValue, rId)
-          saveCandle(candle)
-        } else {
-          logger.info(`⏭️  DOM ignorado (já emitido): ${topValue.toFixed(2)}x`)
-        }
+      const rId = `dom_fallback_${topValue.toFixed(2)}_${Date.now()}`
+
+      if (!candleService.isDuplicate(topValue, rId)) {
+        logger.warn(`⚠️  WS silencioso e valor novo no DOM — fallback: ${topValue.toFixed(2)}x`)
+        candleService.markEmitted(topValue, rId)
+        lastDOMFallbackEmitted = topValue
+        lastKnownValue = topValue
+        lastWSEmitTime = Date.now()
+        const candle = candleService.addCandle(topValue, rId)
+        saveCandle(candle)
       }
     } catch (_) {
       clearInterval(interval)
@@ -206,7 +212,6 @@ function startDOMPolling(frame: Frame): void {
 
 function tryParseCandle(buf: Buffer): void {
   try {
-    // Tentativa 1: JSON puro
     if (buf[0] === 0x7b || buf[0] === 0x5b) {
       try {
         const data = JSON.parse(buf.toString('utf8'))
@@ -215,7 +220,6 @@ function tryParseCandle(buf: Buffer): void {
       } catch (_) {}
     }
 
-    // Tentativa 2: JSON embutido em frame binário
     const jsonStart = buf.indexOf(0x7b)
     if (jsonStart > 0 && jsonStart < buf.length - 2) {
       try {
@@ -225,7 +229,6 @@ function tryParseCandle(buf: Buffer): void {
       } catch (_) {}
     }
 
-    // Tentativa 3: regex em string UTF-8
     const str = buf.toString('utf8')
     const crashMatch = str.match(/crash[^0-9]*([0-9]+\.?[0-9]*)/i)
     if (crashMatch) {
@@ -237,9 +240,8 @@ function tryParseCandle(buf: Buffer): void {
       }
     }
 
-    // Tentativa 4: leitura binária com readDoubleBE
-    // Só usado quando JSON e regex falharam. Dupla checagem BE+LE descarta
-    // leituras ambíguas de endianness que geravam velas fantasmas.
+    // ─── PARSING BINÁRIO: mais restritivo para evitar lixo ───────────────────
+    // Só tenta parsing binário se o buffer contém marcadores conhecidos do jogo
     for (const marker of ['crash', 'maxMultiplier']) {
       const idx = buf.indexOf(marker, 0, 'utf8')
       if (idx === -1) continue
@@ -250,10 +252,18 @@ function tryParseCandle(buf: Buffer): void {
           const valBE = buf.readDoubleBE(pos)
           const valLE = buf.readDoubleLE(pos)
 
+          // Rejeita se não passa na validação primária (inclui limite de 200x)
           if (!isValidMultiplier(valBE)) continue
 
+          // Rejeita ambiguidade BE/LE
           if (isValidMultiplier(valLE) && Math.abs(valBE - valLE) > 0.01) {
             logger.warn(`🚫 WS binário descartado (ambiguidade BE/LE): BE=${valBE} LE=${valLE}`)
+            continue
+          }
+
+          // Rejeita se LE também é válido mas diferente — ambíguo
+          if (isValidMultiplier(valLE) && valBE !== valLE) {
+            logger.warn(`🚫 WS binário descartado (BE≠LE válidos): BE=${valBE} LE=${valLE}`)
             continue
           }
 
@@ -295,7 +305,7 @@ function handleParsedJSON(data: any): void {
   const multNum = Number(mult)
 
   if (!isValidMultiplier(multNum)) {
-    logger.warn(`🚫 JSON descartado (valor inválido): ${multNum}`)
+    logger.warn(`🚫 JSON descartado (valor inválido ou acima de ${MAX_VALID_MULTIPLIER}x): ${multNum}`)
     return
   }
 
@@ -303,7 +313,7 @@ function handleParsedJSON(data: any): void {
   enqueueOrEmit(Number(multNum.toFixed(2)), resolvedRId)
 }
 
-// Se o histórico ainda não foi coletado, enfileira. Caso contrário, emite direto.
+// ─── ANTI-BURST: rejeita múltiplos frames sem round_id real no mesmo segundo ──
 function enqueueOrEmit(mult: number, rId: string): void {
   if (!historyReady) {
     const jaNaFila = wsQueue.some(q => q.rId === rId || (q.mult === mult && rId.startsWith('ws_')))
@@ -313,11 +323,34 @@ function enqueueOrEmit(mult: number, rId: string): void {
     }
     return
   }
+
+  // Frames sem round_id real (gerados por timestamp) são mais propensos a lixo binário.
+  // Se dois chegarem no mesmo segundo, só aceita o primeiro.
+  if (rId.startsWith('ws_') || rId.startsWith('ws_json_')) {
+    const nowSec = Math.floor(Date.now() / 1000)
+    if (nowSec === lastBurstSecond) {
+      burstCount++
+      if (burstCount > 1) {
+        logger.warn(`🚫 Burst descartado (frame ${burstCount} sem round_id no mesmo segundo): ${mult.toFixed(2)}x`)
+        return
+      }
+    } else {
+      lastBurstSecond = nowSec
+      burstCount = 1
+    }
+  }
+
   emitCandle(mult, rId)
 }
 
 function emitCandle(mult: number, rId: string): void {
   if (rId === GLOBAL_LAST_ROUND_ID) return
+
+  // Sempre atualiza lastKnownValue, mesmo quando bloqueado como duplicata,
+  // para que o DOM não reemita um valor que foi bloqueado pelo dedup.
+  lastKnownValue = mult
+  lastWSEmitTime = Date.now()
+
   if (candleService.isDuplicate(mult, rId)) {
     logger.info(`⏭️  WS ignorado (duplicado): ${mult.toFixed(2)}x (Round: ${rId})`)
     return
