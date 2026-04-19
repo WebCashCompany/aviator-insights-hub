@@ -20,7 +20,6 @@ const C = {
 
 const API_BASE = import.meta.env.VITE_BOT_API_URL || 'http://localhost:3001/api/v1'
 
-// Header necessário para o ngrok não bloquear as requisições
 const NGROK_HEADERS: HeadersInit = API_BASE.includes('ngrok')
   ? { 'ngrok-skip-browser-warning': 'true' }
   : {}
@@ -35,7 +34,7 @@ function apiFetch(url: string, options: RequestInit = {}): Promise<Response> {
   })
 }
 
-// Link enviado apenas em: market-paying, warning (pré-sinal) e confirmed (entrada)
+// Link enviado em: market-paying, warning (pré-sinal) e confirmed (entrada)
 const GAME_LINK = 'https://d3c6klm.com/game/action/6770'
 
 // ─── Tipos ────────────────────────────────────────────────────────────────────
@@ -62,9 +61,9 @@ function ssGet<T>(key: string, fallback: T): T {
 function ssSet(key: string, value: unknown): void { try { sessionStorage.setItem(key, JSON.stringify(value)) } catch {} }
 
 // ─── MERCADO PAGANDO ──────────────────────────────────────────────────────────
-const MARKET_PAYING_THRESHOLD = 0.485
+const MARKET_PAYING_THRESHOLD = 0.485   // 48.5% azuis = mercado pagando
 const MARKET_WINDOW           = 80
-const MARKET_ALERT_COOLDOWN   = 10 * 60 * 1000
+const MARKET_ALERT_COOLDOWN   = 10 * 60 * 1000  // 10 minutos entre alertas
 
 function bluePercent(candles: Candle[], n = MARKET_WINDOW): number {
   if (!candles.length) return 0
@@ -86,27 +85,37 @@ function currentBlueStreak(candles: Candle[]): number {
 }
 
 // ─── Backtesting ──────────────────────────────────────────────────────────────
+// Lógica corrigida para s_roxa_azul50:
+// Padrão: [azuis streak = 2 ou 4] → [roxa] → ENTRADA na vela SEGUINTE à roxa
+// idx aponta para a roxa → next1 = idx+1 (entrada), next2 = idx+2 (gale)
 function computeStats(strategy: StrategyDef, candles: Candle[]): StratStats {
   let g1 = 0, g2 = 0, loss = 0
 
   if (strategy.id === 's_roxa_azul50') {
+    // Percorre vela por vela procurando o padrão: roxa após exatamente 2 ou 4 azuis
     let idx = 4
-    while (idx < candles.length - 1) {
+    while (idx < candles.length - 2) {
       const c = candles[idx]
+
       if (c.cor === 'purple') {
+        // Conta azuis imediatamente antes desta roxa
         let streak = 0
         for (let j = idx - 1; j >= 0; j--) {
           if (candles[j].cor === 'blue') streak++
           else break
         }
+
         if (streak === 2 || streak === 4) {
+          // Entrada é na vela SEGUINTE à roxa (idx+1)
           const entryIdx = idx + 1
           const galeIdx  = idx + 2
+
           if (entryIdx >= candles.length) { idx++; continue }
+
           const m1 = Number(candles[entryIdx].multiplicador)
           if (m1 >= 2) {
             g1++
-            idx = entryIdx + 1
+            idx = entryIdx + 1   // pula vela de entrada
           } else if (galeIdx < candles.length) {
             const m2 = Number(candles[galeIdx].multiplicador)
             if (m2 >= 2) { g2++; idx = galeIdx + 1 }
@@ -119,12 +128,14 @@ function computeStats(strategy: StrategyDef, candles: Candle[]): StratStats {
       }
       idx++
     }
+
     const wins    = g1 + g2
     const total   = wins + loss
     const winRate = total > 0 ? (wins / total) * 100 : 0
     return { wins, losses: loss, g1, g2, loss, winRate, total }
   }
 
+  // Demais estratégias: lógica original
   let i = 5
   while (i < candles.length - 2) {
     const slice  = candles.slice(0, i + 1)
@@ -175,7 +186,7 @@ function buildStrategies(config: Record<string, string>): StrategyDef[] {
     },
     {
       id: 's_roxa_azul50', name: 'Sequência da Vela Roxa',
-      description: 'Pré-sinal com 2 ou 4 azuis. Entrada confirmada quando a roxa aparecer.',
+      description: 'Pré-sinal com 2 ou 4 azuis consecutivas. Entrada confirmada quando a roxa aparecer — entre na próxima vela.',
       icon: <Zap className="h-4 w-4" />,
       detectSignal(candles) {
         if (candles.length < 4) return null
@@ -193,6 +204,7 @@ function buildStrategies(config: Record<string, string>): StrategyDef[] {
 
         const last = candles[candles.length - 1]
 
+        // ── Roxa acabou de aparecer: verifica o streak de azuis antes dela ──
         if (last?.cor === 'purple') {
           let streak = 0
           for (let i = candles.length - 2; i >= 0; i--) {
@@ -200,7 +212,7 @@ function buildStrategies(config: Record<string, string>): StrategyDef[] {
             else break
           }
           if (streak === 2 || streak === 4)
-            return { tipo: 'entrar', msg: `🚀 ENTRADA CONFIRMADA — roxa após ${streak} azuis! Entre AGORA!`, color: C.green }
+            return { tipo: 'entrar', msg: `🚀 ENTRADA CONFIRMADA — roxa após ${streak} azuis! Entre na PRÓXIMA vela!`, color: C.green }
           if (streak === 3)
             return { tipo: 'bloqueado', msg: `Roxa veio após 3 azuis — padrão inválido (precisa exatamente 2 ou 4)`, color: C.amber }
           if (streak < 2)
@@ -208,6 +220,7 @@ function buildStrategies(config: Record<string, string>): StrategyDef[] {
           return { tipo: 'bloqueado', msg: `Roxa veio após ${streak} azuis — passou do limite (máximo 4)`, color: C.amber }
         }
 
+        // ── Azul: conta streak atual e emite pré-sinal ──
         if (last?.cor === 'blue') {
           let bluesNow = 0
           for (let i = candles.length - 1; i >= 0; i--) {
@@ -305,7 +318,9 @@ function WppBar({ wppConfig, onUpdate, selectedStrategyName }: {
   const serverOk   = wppConfig.serverConfigured
 
   const statusLabel = wppConfig.enabled
-    ? selectedStrategyName ? `Ativo · ${selectedStrategyName}` : 'Ativo · selecione uma estratégia'
+    ? selectedStrategyName
+      ? `Ativo · ${selectedStrategyName} · alerta de mercado ON`
+      : 'Ativo · alerta de mercado pagando ON'
     : hasTargets
       ? `${wppConfig.targets.length} destino${wppConfig.targets.length > 1 ? 's' : ''} configurado${wppConfig.targets.length > 1 ? 's' : ''}`
       : 'Nenhum destino configurado'
@@ -407,7 +422,8 @@ export default function StrategiesPage() {
   const tradeRef       = useRef<TradeState>({ phase: 'idle', entryCandles: 0, stratName: '', preSignalStreak: 0 })
   const prevBlueStreak = useRef<number>(-1)
   const prevTipoRef    = useRef<string | null>(null)
-  const lastWsCount    = useRef<number>(-1)
+  // Rastreia o total de velas (ws + db) para detectar nova vela independente de estratégia
+  const lastTotalCount = useRef<number>(-1)
   const lastPayAlertAt = useRef<number>(0)
 
   type TradeDisplay =
@@ -487,9 +503,11 @@ export default function StrategiesPage() {
     }
   }, [wppConfig.enabled, wppConfig.serverConfigured, wppConfig.targets, updateWppConfig])
 
+  // ── Alerta de mercado pagando (independente de estratégia selecionada) ──
   const apiPostMarket = useCallback(async () => {
     if (!wppConfig.enabled || !wppConfig.serverConfigured || !wppConfig.targets.length) return
     try {
+      console.info('[WPP] Enviando market-paying com link')
       await apiFetch(`${API_BASE}/whatsapp/market-paying`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -497,23 +515,34 @@ export default function StrategiesPage() {
       })
       updateWppConfig({ lastSentAt: Date.now() })
       console.info('[WPP] ✅ market-paying enviado com link')
-    } catch {}
+    } catch (e) {
+      console.error('[WPP] Falha ao enviar market-paying:', e)
+    }
   }, [wppConfig.enabled, wppConfig.serverConfigured, wppConfig.targets, updateWppConfig])
 
-  // ─── Monitor principal ────────────────────────────────────────────────────
+  // ─── Monitor de mercado pagando — SEMPRE ativo enquanto robô ligado ───────
+  // Roda separadamente do monitor de estratégia para garantir que o alerta
+  // dispare mesmo quando nenhuma estratégia está selecionada.
   useEffect(() => {
     if (!wppConfig.enabled) return
     if (!candles.length) return
 
-    if (wsCandles.length !== lastWsCount.current) {
-      lastWsCount.current = wsCandles.length
-      const paying = bluePercent(candles, MARKET_WINDOW) < MARKET_PAYING_THRESHOLD
-      if (paying && Date.now() - lastPayAlertAt.current >= MARKET_ALERT_COOLDOWN) {
-        lastPayAlertAt.current = Date.now()
-        apiPostMarket()
-      }
-    }
+    const totalNow = candles.length
+    if (totalNow === lastTotalCount.current) return   // sem nova vela
+    lastTotalCount.current = totalNow
 
+    const paying = bluePercent(candles, MARKET_WINDOW) < MARKET_PAYING_THRESHOLD
+    if (paying && Date.now() - lastPayAlertAt.current >= MARKET_ALERT_COOLDOWN) {
+      lastPayAlertAt.current = Date.now()
+      console.info('[Mercado] Pagando! Disparando alerta WPP com link.')
+      apiPostMarket()
+    }
+  }, [candles, wppConfig.enabled, apiPostMarket])
+
+  // ─── Monitor de estratégia ────────────────────────────────────────────────
+  useEffect(() => {
+    if (!wppConfig.enabled) return
+    if (!candles.length) return
     if (!selected) return
 
     const tipo  = sinalAtual?.tipo ?? null
@@ -536,6 +565,7 @@ export default function StrategiesPage() {
         }
       } else if (trade.phase === 'pre_sinal') {
         if (tipo === 'entrar') {
+          // Roxa confirmada — avisa que a PRÓXIMA vela é a entrada
           console.info('[Roxa] Roxa confirmada — enviando confirmed com link')
           apiPost('/whatsapp/confirmed', { strategyName: selected.name }, true)
           tradeRef.current = { ...trade, phase: 'confirmed', entryCandles: wsCandles.length }
@@ -546,6 +576,7 @@ export default function StrategiesPage() {
           setTradeDisplay({ kind: 'idle' })
         }
       } else if (trade.phase === 'confirmed') {
+        // Aguarda a vela APÓS a roxa (a entrada real do usuário)
         if (wsCandles.length > trade.entryCandles) {
           const mult = Number(candles[candles.length - 1].multiplicador)
           if (mult >= 2) {
@@ -576,6 +607,7 @@ export default function StrategiesPage() {
       prevBlueStreak.current = streak
 
     } else {
+      // ── Estratégias genéricas ──────────────────────────────────────────────
       const paying = bluePercent(candles, MARKET_WINDOW) < MARKET_PAYING_THRESHOLD
 
       if (!paying) {
@@ -628,13 +660,13 @@ export default function StrategiesPage() {
 
       prevTipoRef.current = tipo
     }
-  }, [candles, wsCandles, sinalAtual, wppConfig.enabled, selected, apiPost, apiPostMarket])
+  }, [candles, wsCandles, sinalAtual, wppConfig.enabled, selected, apiPost])
 
   useEffect(() => {
     tradeRef.current       = { phase: 'idle', entryCandles: 0, stratName: '', preSignalStreak: 0 }
     prevBlueStreak.current = -1
     prevTipoRef.current    = null
-    lastWsCount.current    = -1
+    lastTotalCount.current = -1
     setTradeDisplay({ kind: 'idle' })
   }, [selectedId])
 
@@ -703,7 +735,7 @@ export default function StrategiesPage() {
               <span className="h-2 w-2 rounded-full animate-pulse shrink-0" style={{ background: C.green }} />
               <div className="flex-1 min-w-0">
                 <p className="text-[10px] text-white/35 uppercase tracking-widest mb-0.5">{selected.name}</p>
-                <p className="text-sm font-semibold" style={{ color: C.green }}>🚀 ENTRADA CONFIRMADA — aguardando resultado (2x+)</p>
+                <p className="text-sm font-semibold" style={{ color: C.green }}>🚀 ENTRADA CONFIRMADA — entre na PRÓXIMA vela! Aguardando resultado (2x+)</p>
               </div>
             </div>
           </div>
