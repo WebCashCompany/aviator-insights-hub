@@ -7,6 +7,11 @@ import { calcularStats, detectarPadroes, corParaLabel } from '@/utils/candleUtil
 const INITIAL_LOAD = 60
 const LOAD_MORE = 60
 
+// ─── Bucket de 10s para deduplicação por valor+tempo ─────────────────────────
+// Reduzido de 3s para 10s pois rounds do Aviator duram ~15-60s,
+// portanto o mesmo multiplicador em menos de 10s é quase certamente duplicata.
+const DEDUP_BUCKET_MS = 10_000
+
 function formatHora(ts: string): string {
   return new Date(ts).toLocaleTimeString('pt-BR', {
     hour: '2-digit', minute: '2-digit', second: '2-digit',
@@ -63,35 +68,56 @@ function CorBadge({ cor }: { cor: Candle['cor'] }) {
   )
 }
 
+// ─── Chave de deduplicação ────────────────────────────────────────────────────
+// Prioridade 1: usa o id real da vela (round_id do banco) quando disponível.
+// Prioridade 2: multiplicador + bucket de tempo de 10s como fallback.
+function dedupKey(c: Candle): string {
+  // Se o id não começa com prefixo gerado localmente, é um id real → usa direto
+  const id = (c as any).id ?? ''
+  if (id && !id.startsWith('ws_') && !id.startsWith('dom_') && !id.startsWith('hist_')) {
+    return `id_${id}`
+  }
+  // Fallback: mult + bucket de 10s
+  const ts = c.created_at || (c as any).timestamp || ''
+  const bucket = Math.floor(new Date(ts).getTime() / DEDUP_BUCKET_MS)
+  return `mult_${Number(c.multiplicador).toFixed(2)}_${bucket}`
+}
+
 export default function HistoryPage() {
   const { candles: wsCandles } = useWS()
 
-  // ── Filtro de quantidade (últimas N velas) ─────────────────────────────────
-  const [limite, setLimite] = useState<Limite>(1000)
+  const [limite, setLimite] = useState<Limite>(100)
 
-  // ── Busca tudo do banco; o corte acontece APÓS o merge com WS ─────────────
   const { candles: dbCandles, loading } = useCandles({ limit: 5000 })
 
   // ── Merge: banco + WebSocket, sem duplicatas ───────────────────────────────
+  // Regra: banco tem precedência sobre WS (dados do banco são a fonte da verdade).
+  // WS só é adicionado se não existir chave equivalente no banco.
   const candles = useMemo<Candle[]>(() => {
     const wsArr = Array.isArray(wsCandles) ? wsCandles : []
 
-    const key = (c: any) => {
-      const bucket = Math.floor(new Date(c.created_at || c.timestamp).getTime() / 3000)
-      return `${Number(c.multiplicador).toFixed(2)}_${bucket}`
+    const map = new Map<string, Candle>()
+
+    // 1. Insere banco primeiro (fonte da verdade)
+    for (const c of dbCandles) {
+      map.set(dedupKey(c as Candle), c as Candle)
     }
 
-    const map = new Map<string, Candle>()
-    for (const c of dbCandles) map.set(key(c), c as Candle)
-    for (const c of wsArr) { if (!map.has(key(c))) map.set(key(c), c) }
+    // 2. Adiciona WS apenas se não existir chave equivalente
+    for (const c of wsArr) {
+      const k = dedupKey(c)
+      if (!map.has(k)) {
+        map.set(k, c)
+      }
+    }
 
     return Array.from(map.values())
       .sort((a, b) => {
-        const ta = new Date((a.created_at || a.timestamp) as string).getTime()
-        const tb = new Date((b.created_at || b.timestamp) as string).getTime()
+        const ta = new Date(((a.created_at || (a as any).timestamp) as string)).getTime()
+        const tb = new Date(((b.created_at || (b as any).timestamp) as string)).getTime()
         return tb - ta // mais recente primeiro
       })
-      .slice(0, limite) // garante o limite após o merge com WS
+      .slice(0, limite)
   }, [dbCandles, wsCandles, limite])
 
   const [filtro, setFiltro]       = useState<Filtro>('all')
@@ -108,7 +134,7 @@ export default function HistoryPage() {
     const curr = wsCandles.length
     if (curr > prevLen.current) {
       const recentes = wsCandles.slice(prevLen.current)
-      const ids = new Set(recentes.map((c) => c.id))
+      const ids = new Set(recentes.map((c) => (c as any).id ?? dedupKey(c)))
       setNovosIds(ids)
       const t = setTimeout(() => setNovosIds(new Set()), 500)
       prevLen.current = curr
@@ -150,7 +176,6 @@ export default function HistoryPage() {
     return () => obs.disconnect()
   }, [onIntersect])
 
-  // Para stats, precisamos da ordem cronológica (mais antiga primeiro)
   const candlesAsc = useMemo(() => [...candles].reverse(), [candles])
   const stats   = useMemo(() => (candlesAsc.length ? calcularStats(candlesAsc) : null), [candlesAsc])
   const padroes = useMemo(() => detectarPadroes(candlesAsc), [candlesAsc])
@@ -163,7 +188,6 @@ export default function HistoryPage() {
     blue: 'text-blue-400', purple: 'text-purple-400', pink: 'text-pink-400',
   }
 
-  // ── Loading state ──────────────────────────────────────────────────────────
   if (loading) {
     return (
       <div className="flex flex-col items-center justify-center min-h-[60vh] gap-3 text-muted-foreground">
@@ -384,7 +408,11 @@ export default function HistoryPage() {
               style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(64px, 1fr))' }}
             >
               {visivelSlice.map((candle) => (
-                <VelaCard key={candle.id} candle={candle} isNew={novosIds.has(candle.id)} />
+                <VelaCard
+                  key={dedupKey(candle)}
+                  candle={candle}
+                  isNew={novosIds.has((candle as any).id ?? dedupKey(candle))}
+                />
               ))}
             </div>
           )}
@@ -412,13 +440,13 @@ export default function HistoryPage() {
               </thead>
               <tbody>
                 {visivelSlice.map((candle) => {
-                  const ts = candle.created_at || candle.timestamp
+                  const ts = candle.created_at || (candle as any).timestamp
                   const multColor: Record<Candle['cor'], string> = {
                     blue: 'text-blue-400', purple: 'text-purple-400', pink: 'text-pink-400',
                   }
                   return (
                     <tr
-                      key={candle.id}
+                      key={dedupKey(candle)}
                       className="border-b border-border/50 last:border-none hover:bg-muted/30 transition-colors"
                     >
                       <td className="px-3 py-2 text-muted-foreground font-mono">{formatHora(ts)}</td>
@@ -427,7 +455,7 @@ export default function HistoryPage() {
                       </td>
                       <td className="px-3 py-2"><CorBadge cor={candle.cor} /></td>
                     </tr>
-                  ) 
+                  )
                 })}
               </tbody>
             </table>
