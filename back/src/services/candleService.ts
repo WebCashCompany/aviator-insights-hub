@@ -4,172 +4,101 @@ import { calcularCor } from '../utils/colorCalc.js'
 import { logger } from '../utils/logger.js'
 import { EventEmitter } from 'events'
 import { alertMarketPaying, getPayThreshold, isConfigured as wppConfigured } from './whatsappService.js'
+import { supabase } from './supabaseService.js'
 
-const MAX_CANDLES = 1000
-
-// ─── JANELAS DE DEDUPLICAÇÃO ──────────────────────────────────────────────────
-//
-// PROBLEMA RAIZ IDENTIFICADO:
-// O histórico (35 velas) é salvo no início com markEmitted() — isso poluía a
-// emittedValues e bloqueava rounds legítimos com o mesmo multiplicador que
-// chegavam logo depois (ex: 1.24x no hist → 1.24x real bloqueado 60s depois).
-//
-// SOLUÇÃO:
-// - emittedValues só é atualizada por velas AO VIVO (não pelo histórico).
-// - A janela de dedup por valor é CURTA (15s): suficiente para absorver o
-//   double-fire WS + DOM polling, mas sem bloquear rounds legítimos.
-// - O histórico usa apenas emittedRoundIds (por id sintético de posição).
-
-const DEDUP_ROUND_ID_MS = 30 * 60 * 1000  // 30 min — dedup por ID exato (reconexões)
-const DEDUP_VALUE_MS    = 15_000           // 15 s   — dedup por valor AO VIVO apenas
+const MAX_CANDLES = 500
+const DEDUP_VALUE_MS = 10_000 
 
 class CandleService extends EventEmitter {
   private candles: Candle[] = []
   private totalCaptured = 0
+  private emittedRoundIds = new Set<string>()
+  private isInitialized = false
 
-  // Camada 1: por rodada_id exato
-  private emittedRoundIds = new Map<string, number>()
+  async initialize() {
+    if (this.isInitialized) return
+    logger.info('🔄 Sincronizando Memória Blindada com Supabase...')
+    try {
+      const { data } = await supabase
+        .from('candles')
+        .select('rodada_id, multiplicador, timestamp')
+        .order('timestamp', { ascending: false })
+        .limit(200)
 
-  // Camada 2: por valor — apenas velas AO VIVO (não histórico)
-  private emittedValues = new Map<string, number>()
-
-  // ── isSyntheticId ────────────────────────────────────────────────────────────
-  isSyntheticId(id: string): boolean {
-    return (
-      id.startsWith('ws_') ||
-      id.startsWith('ws_json_') ||
-      id.startsWith('dom_') ||
-      id.startsWith('hist_')
-    )
-  }
-
-  // ── isHistoryId ──────────────────────────────────────────────────────────────
-  // IDs do histórico inicial — não devem poluir emittedValues
-  private isHistoryId(id: string): boolean {
-    return id.startsWith('hist_')
-  }
-
-  // ── isDuplicate ──────────────────────────────────────────────────────────────
-  isDuplicate(multiplicador: number, rodada_id?: string): boolean {
-    const now = Date.now()
-
-    // Camada 1: ID exato já visto (cobre reconexões com mesmo round_id real)
-    if (rodada_id) {
-      const lastById = this.emittedRoundIds.get(rodada_id)
-      if (lastById !== undefined && now - lastById < DEDUP_ROUND_ID_MS) {
-        return true
+      if (data) {
+        data.forEach(c => {
+          if (c.rodada_id) this.emittedRoundIds.add(c.rodada_id)
+          if (this.candles.length < 100) this.candles.push(c as Candle)
+        })
+        this.isInitialized = true
+        logger.info(`✅ Memória pronta: ${this.emittedRoundIds.size} registros carregados.`)
       }
+    } catch (err) {
+      logger.error('❌ Erro no initialize:', err)
     }
+  }
 
-    // Camada 2: mesmo valor ao vivo nos últimos 15s
-    // Histórico NÃO entra aqui — isHistoryId é excluído no markEmitted
-    const key = multiplicador.toFixed(2)
-    const lastByValue = this.emittedValues.get(key)
-    if (lastByValue !== undefined && now - lastByValue < DEDUP_VALUE_MS) {
-      return true
+  // Verifica se uma sequência de valores já existe para evitar re-scrape do histórico
+  isSequenceDuplicate(values: number[]): boolean {
+    if (this.candles.length < 5) return false
+    const currentSequence = this.candles.slice(-10).map(c => c.multiplicador.toFixed(2)).join('|')
+    const incomingSequence = values.slice(-10).map(v => v.toFixed(2)).join('|')
+    return currentSequence.includes(incomingSequence) || incomingSequence.includes(currentSequence)
+  }
+
+  isDuplicate(multiplicador: number, rodada_id?: string): boolean {
+    if (rodada_id && this.emittedRoundIds.has(rodada_id)) return true
+
+    const last = this.getLastCandle()
+    if (last && last.multiplicador === multiplicador) {
+      const diff = Date.now() - new Date(last.timestamp).getTime()
+      if (diff < DEDUP_VALUE_MS) return true
     }
-
     return false
   }
 
-  // ── markEmitted ──────────────────────────────────────────────────────────────
-  markEmitted(multiplicador: number, rodada_id?: string): void {
-    const now = Date.now()
-
-    if (rodada_id) {
-      this.emittedRoundIds.set(rodada_id, now)
-      this.cleanupMap(this.emittedRoundIds, DEDUP_ROUND_ID_MS)
-    }
-
-    // ⚠️ HISTÓRICO NÃO POLUI emittedValues
-    // Apenas velas ao vivo (dom_, ws_, ws_json_ e IDs reais) entram aqui
-    if (!rodada_id || !this.isHistoryId(rodada_id)) {
-      const key = multiplicador.toFixed(2)
-      this.emittedValues.set(key, now)
-      this.cleanupMap(this.emittedValues, DEDUP_VALUE_MS * 2)
-    }
-  }
-
-  // ── addCandle ────────────────────────────────────────────────────────────────
-  addCandle(multiplicador: number, rodada_id: string): Candle {
-    const now = new Date().toISOString()
-
+  addCandle(multiplicador: number, rodada_id: string, customTime?: string): Candle {
+    const timestamp = customTime || new Date().toISOString()
+    
     const candle: Candle = {
       id: uuidv4(),
       multiplicador,
       cor: calcularCor(multiplicador),
       rodada_id,
-      timestamp: now,
-      created_at: now,
-      fonte: 'auto',
+      timestamp,
+      created_at: new Date().toISOString(),
+      fonte: rodada_id.startsWith('dom') ? 'dom' : (rodada_id.startsWith('ws') ? 'ws' : 'hist'),
     }
 
+    this.emittedRoundIds.add(rodada_id)
     if (this.candles.length >= MAX_CANDLES) this.candles.shift()
-
     this.candles.push(candle)
     this.totalCaptured++
 
-    logger.info(`🕯️  Nova vela: ${multiplicador}x [${candle.cor.toUpperCase()}] | Total: ${this.totalCaptured}`)
-
+    logger.info(`🕯️ [${candle.fonte.toUpperCase()}] ${multiplicador}x gravado com sucesso.`)
     this.emit('new_candle', candle)
 
     if (wppConfigured() && multiplicador >= getPayThreshold()) {
-      alertMarketPaying().catch(err =>
-        logger.error(`[WhatsApp] Erro no alerta de pagamento: ${err.message}`)
-      )
+      alertMarketPaying().catch(() => {})
     }
 
     return candle
   }
 
-  // ── Helpers ───────────────────────────────────────────────────────────────────
-
-  private cleanupMap(map: Map<string, number>, maxAgeMs: number): void {
-    const now = Date.now()
-    for (const [k, ts] of map) {
-      if (now - ts > maxAgeMs) map.delete(k)
-    }
-  }
-
-  // ── Consultas ─────────────────────────────────────────────────────────────────
-
-  getCandles(limit = 100): Candle[] {
-    return this.candles.slice(-limit)
-  }
-
-  getLastCandle(): Candle | null {
-    return this.candles[this.candles.length - 1] || null
-  }
-
-  getTotalCaptured(): number {
-    return this.totalCaptured
-  }
-
+  getLastCandle(): Candle | null { return this.candles[this.candles.length - 1] || null }
+  getTotalCaptured() { return this.totalCaptured }
+  
   getStats() {
     const total = this.candles.length
     if (total === 0) return null
-
-    const blue   = this.candles.filter(c => c.cor === 'blue').length
-    const purple = this.candles.filter(c => c.cor === 'purple').length
-    const pink   = this.candles.filter(c => c.cor === 'pink').length
-    const mults  = this.candles.map(c => c.multiplicador)
-
+    const mults = this.candles.map(c => c.multiplicador)
     return {
       total,
-      blue:   { count: blue,   percent: ((blue   / total) * 100).toFixed(1) },
-      purple: { count: purple, percent: ((purple / total) * 100).toFixed(1) },
-      pink:   { count: pink,   percent: ((pink   / total) * 100).toFixed(1) },
-      maior:  Math.max(...mults),
-      menor:  Math.min(...mults),
-      media:  (mults.reduce((a, b) => a + b, 0) / total).toFixed(2),
+      blue: { count: this.candles.filter(c => c.cor === 'blue').length },
+      purple: { count: this.candles.filter(c => c.cor === 'purple').length },
+      pink: { count: this.candles.filter(c => c.cor === 'pink').length },
+      media: (mults.reduce((a, b) => a + b, 0) / total).toFixed(2)
     }
-  }
-
-  clear() {
-    this.candles = []
-    this.emittedRoundIds.clear()
-    this.emittedValues.clear()
-    logger.warn('Buffer de velas limpo')
   }
 }
 
