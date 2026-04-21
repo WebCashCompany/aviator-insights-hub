@@ -6,6 +6,7 @@ import { calcularStats, detectarPadroes, corParaLabel } from '@/utils/candleUtil
 
 const INITIAL_LOAD = 60
 const LOAD_MORE    = 60
+const DB_POLL_INTERVAL_MS = 8_000   // fallback polling caso o WS perca eventos
 
 function formatHora(ts: string): string {
   return new Date(ts).toLocaleTimeString('pt-BR', {
@@ -18,18 +19,30 @@ type Ordenacao = 'recent' | 'asc' | 'desc'
 type TabView   = 'grade' | 'lista'
 type Limite    = number
 
-// ─── Chave de deduplicação ────────────────────────────────────────────────────
-// Usa rodada_id como chave sempre que disponível.
-// Nunca usa bucket de tempo — isso colapsava velas legítimas com mesmo valor.
-function dedupKey(c: Candle): string {
+// ─── Chaves de deduplicação ───────────────────────────────────────────────────
+
+function candleKey(c: Candle): string {
   const rid = (c as any).rodada_id as string | undefined | null
   if (rid) return `rid_${rid}`
-  return `id_${c.id}`
+  // Fallback consistente: usa só o id do banco — mesma lógica do dbKey
+  return `db_${c.id}`
+}
+
+/**
+ * BUG CORRIGIDO: `hist_*` são velas do scrape inicial (já persistidas no banco,
+ * chegam via WS apenas como eco do HISTORY). Devem ser ignoradas no merge WS→UI
+ * para evitar duplicatas.
+ *
+ * `dom_*` são detecções em tempo real do DOM polling (fallback quando o WS do jogo
+ * silencia). Devem aparecer imediatamente — NÃO devem ser filtradas aqui.
+ */
+function isScrapedHistory(rid: string | undefined | null): boolean {
+  return !!rid && rid.startsWith('hist_')
 }
 
 // ─── VelaCard ─────────────────────────────────────────────────────────────────
 function VelaCard({ candle, isNew }: { candle: Candle; isNew: boolean }) {
-  const ts = (candle.created_at || (candle as any).timestamp) as string
+  const ts = ((candle as any).timestamp || candle.created_at) as string
   const bgMap: Record<Candle['cor'], string> = {
     blue:   'bg-blue-500/10   border-blue-500/25   hover:border-blue-400/60',
     purple: 'bg-purple-500/10 border-purple-500/25 hover:border-purple-400/60',
@@ -78,49 +91,77 @@ function CorBadge({ cor }: { cor: Candle['cor'] }) {
 export default function HistoryPage() {
   const { candles: wsCandles } = useWS()
   const [limite, setLimite]    = useState<Limite>(100)
-  const { candles: dbCandles, loading } = useCandles({ limit: 5000 })
+
+  // BUG CORRIGIDO: expõe `refetch` para polling periódico como fallback.
+  // Se o WS perder um evento NEW_CANDLE, o polling garante que a vela apareça
+  // em até DB_POLL_INTERVAL_MS ms sem necessidade de recarregar a página.
+  const { candles: dbCandles, loading, refetch } = useCandles({ limit: 5000 })
+
+  // ── Polling periódico do banco (fallback para eventos WS perdidos) ─────────
+  useEffect(() => {
+    if (typeof refetch !== 'function') return
+    const id = setInterval(() => refetch(), DB_POLL_INTERVAL_MS)
+    return () => clearInterval(id)
+  }, [refetch])
+
+  // ── Rastreia chaves já vistas para detectar novidades e animar ────────────
+  const seenKeys = useRef<Set<string>>(new Set())
+  const [novosIds, setNovosIds] = useState<Set<string>>(new Set())
+
+  useEffect(() => {
+    if (!wsCandles.length) return
+    const novos: string[] = []
+    for (const c of wsCandles) {
+      const rid = (c as any).rodada_id as string | undefined | null
+      // Velas do scrape inicial não animam — chegaram no passado
+      if (isScrapedHistory(rid)) continue
+      const k = candleKey(c)
+      if (!seenKeys.current.has(k)) {
+        seenKeys.current.add(k)
+        novos.push(k)
+      }
+    }
+    if (novos.length > 0) {
+      setNovosIds(new Set(novos))
+      const t = setTimeout(() => setNovosIds(new Set()), 500)
+      return () => clearTimeout(t)
+    }
+  }, [wsCandles])
 
   // ── Merge DB + WS sem duplicatas ──────────────────────────────────────────
+  //
   // Estratégia:
-  // 1. O banco é a fonte de verdade para o histórico.
-  // 2. Velas WS só entram se forem POSTERIORES à vela mais recente do banco
-  //    OU se o banco ainda estiver vazio.
-  // 3. Deduplicação por rodada_id — nunca por bucket de tempo.
-  // 4. Velas WS com rodada_id histórico (hist_/dom_) são ignoradas —
-  //    elas já estão no banco ou foram superadas pelas reais.
+  //   1. DB é a fonte de verdade para histórico persistido.
+  //   2. WS complementa com velas ao vivo que ainda não chegaram ao banco
+  //      (janela de ~1–3 s entre emissão e persistência).
+  //
+  // BUG CORRIGIDO: chave unificada `rid_*` / `db_*` tanto para DB quanto para
+  // WS — antes, candles sem rodada_id usavam chaves divergentes (fallback_* vs
+  // db_*), causando duplicatas ou velas sumindo do merge.
+  //
+  // BUG CORRIGIDO: `dom_*` candles (DOM polling em tempo real) NÃO são mais
+  // filtradas — apenas `hist_*` (scrape inicial) são ignoradas.
   const candles = useMemo<Candle[]>(() => {
-    const wsArr = Array.isArray(wsCandles) ? wsCandles : []
-    const map   = new Map<string, Candle>()
+    const map = new Map<string, Candle>()
 
-    // 1. Banco primeiro — fonte de verdade
-    for (const c of dbCandles) map.set(dedupKey(c as Candle), c as Candle)
+    // 1. Banco primeiro
+    for (const c of dbCandles) {
+      map.set(candleKey(c as Candle), c as Candle)
+    }
 
-    // 2. Timestamp da vela mais recente do banco
-    const dbMaxTs = dbCandles.length > 0
-      ? Math.max(...dbCandles.map(c => new Date(((c as any).created_at || (c as any).timestamp) as string).getTime()))
-      : 0
-
-    // 3. WS: só aceita velas genuinamente novas
-    for (const c of wsArr) {
+    // 2. WS: adiciona apenas o que ainda não está no banco
+    for (const c of wsCandles) {
       const rid = (c as any).rodada_id as string | undefined | null
-
-      // Ignora velas com rodada_id histórico — já estão no banco
-      if (rid && (rid.startsWith('hist_') || rid.startsWith('dom_'))) continue
-
-      const cTs = new Date(((c.created_at || (c as any).timestamp) as string)).getTime()
-
-      // Só aceita velas WS posteriores ao banco (com tolerância de 5s para clock skew)
-      // OU quando o banco está vazio
-      if (dbMaxTs > 0 && cTs < dbMaxTs - 5_000) continue
-
-      const k = dedupKey(c)
+      // Apenas scrape inicial é ignorado — dom_* e ws_* são eventos ao vivo
+      if (isScrapedHistory(rid)) continue
+      const k = candleKey(c)
       if (!map.has(k)) map.set(k, c)
     }
 
     return Array.from(map.values())
       .sort((a, b) => {
-        const ta = new Date(((a.created_at || (a as any).timestamp) as string)).getTime()
-        const tb = new Date(((b.created_at || (b as any).timestamp) as string)).getTime()
+        const ta = new Date((((a as any).timestamp || a.created_at) as string)).getTime()
+        const tb = new Date((((b as any).timestamp || b.created_at) as string)).getTime()
         return tb - ta
       })
       .slice(0, limite)
@@ -131,23 +172,8 @@ export default function HistoryPage() {
   const [ordenacao, setOrdenacao] = useState<Ordenacao>('recent')
   const [tab, setTab]             = useState<TabView>('grade')
   const [visivel, setVisivel]     = useState(INITIAL_LOAD)
-  const [novosIds, setNovosIds]   = useState<Set<string>>(new Set())
 
   const loaderRef = useRef<HTMLDivElement>(null)
-  const prevLen   = useRef(wsCandles.length)
-
-  useEffect(() => {
-    const curr = wsCandles.length
-    if (curr > prevLen.current) {
-      const recentes = wsCandles.slice(prevLen.current)
-      const ids = new Set(recentes.map(c => dedupKey(c)))
-      setNovosIds(ids)
-      const t = setTimeout(() => setNovosIds(new Set()), 500)
-      prevLen.current = curr
-      return () => clearTimeout(t)
-    }
-    prevLen.current = curr
-  }, [wsCandles])
 
   useEffect(() => { setVisivel(INITIAL_LOAD) }, [filtro, busca, ordenacao, limite])
 
@@ -193,7 +219,7 @@ export default function HistoryPage() {
     blue: 'text-blue-400', purple: 'text-purple-400', pink: 'text-pink-400',
   }
 
-  if (loading) {
+  if (loading && !candles.length) {
     return (
       <div className="flex flex-col items-center justify-center min-h-[60vh] gap-3 text-muted-foreground">
         <p className="text-sm animate-pulse">Carregando histórico...</p>
@@ -408,13 +434,16 @@ export default function HistoryPage() {
               className="grid gap-1.5"
               style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(64px, 1fr))' }}
             >
-              {visivelSlice.map(candle => (
-                <VelaCard
-                  key={dedupKey(candle)}
-                  candle={candle}
-                  isNew={novosIds.has(dedupKey(candle))}
-                />
-              ))}
+              {visivelSlice.map(candle => {
+                const key = candleKey(candle)
+                return (
+                  <VelaCard
+                    key={key}
+                    candle={candle}
+                    isNew={novosIds.has(key)}
+                  />
+                )
+              })}
             </div>
           )}
           {visivel < filtered.length && (
@@ -441,14 +470,17 @@ export default function HistoryPage() {
               </thead>
               <tbody>
                 {visivelSlice.map(candle => {
-                  const ts = (candle.created_at || (candle as any).timestamp) as string
+                  const ts  = ((candle as any).timestamp || candle.created_at) as string
+                  const key = candleKey(candle)
                   const multColor: Record<Candle['cor'], string> = {
                     blue: 'text-blue-400', purple: 'text-purple-400', pink: 'text-pink-400',
                   }
                   return (
                     <tr
-                      key={dedupKey(candle)}
-                      className="border-b border-border/50 last:border-none hover:bg-muted/30 transition-colors"
+                      key={key}
+                      className={`border-b border-border/50 last:border-none hover:bg-muted/30 transition-colors ${
+                        novosIds.has(key) ? 'animate-[popIn_0.3s_ease]' : ''
+                      }`}
                     >
                       <td className="px-3 py-2 text-muted-foreground font-mono">{formatHora(ts)}</td>
                       <td className={`px-3 py-2 font-medium ${multColor[candle.cor]}`}>
