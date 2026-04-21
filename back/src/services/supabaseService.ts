@@ -10,6 +10,11 @@ const supabase = createClient(
 
 let resolvedUserId: string | null = null
 
+// ─── SET LOCAL: garante que nenhum rodada_id é inserido 2x nesta sessão ──────
+// Mesmo que o candleService falhe ou o burst chegue em paralelo,
+// este set é a última barreira antes do INSERT.
+const insertedRodadaIds = new Set<string>()
+
 export async function initBotUser(): Promise<void> {
   const email = process.env.BET923_EMAIL
 
@@ -36,7 +41,7 @@ export async function initBotUser(): Promise<void> {
     resolvedUserId = user.id
     logger.info(`✅ Bot vinculado ao usuário: ${email} (user_id: ${resolvedUserId})`)
 
-    // Limpa todas as velas do banco ao iniciar
+    insertedRodadaIds.clear()
     await clearCandles()
   } catch (err: any) {
     logger.error(`💥 Erro crítico ao buscar usuário: ${err.message}`)
@@ -67,24 +72,51 @@ export async function saveCandle(candle: Candle): Promise<void> {
     return
   }
 
+  const rodadaId = candle.rodada_id ?? `fallback_${candle.multiplicador.toFixed(2)}_${Date.now()}`
+
+  // ─── BARREIRA 1: set em memória (síncrono, zero latência) ────────────────
+  if (insertedRodadaIds.has(rodadaId)) {
+    logger.info(`⏭️  saveCandle ignorado (já inserido nesta sessão): ${rodadaId}`)
+    return
+  }
+  insertedRodadaIds.add(rodadaId)
+
   try {
-    const { error } = await supabase.from('candles').insert({
-      user_id: resolvedUserId,
-      multiplicador: candle.multiplicador,
-      cor: candle.cor,
-      rodada_id: candle.rodada_id,
-      fonte: 'auto',
-      created_at: new Date().toISOString(),
-    })
+    // ─── BARREIRA 2: upsert com onConflict em rodada_id ──────────────────
+    // Se o banco tiver constraint UNIQUE em (user_id, rodada_id),
+    // conflitos são silenciosamente ignorados — zero duplicata no banco.
+    // Se não tiver a constraint ainda, o insert normal ocorre mas a
+    // barreira 1 já cobre 99% dos casos desta sessão.
+    const { error } = await supabase.from('candles').upsert(
+      {
+        user_id:      resolvedUserId,
+        multiplicador: candle.multiplicador,
+        cor:           candle.cor,
+        rodada_id:     rodadaId,
+        fonte:         'auto',
+        created_at:    new Date().toISOString(),
+      },
+      {
+        onConflict:        'user_id,rodada_id',  // requer constraint UNIQUE no banco
+        ignoreDuplicates:  true,                 // não lança erro, apenas ignora
+      }
+    )
 
     if (error) {
-      if (error.code !== '23505') {
+      // 23505 = unique_violation — pode chegar se a constraint existir e
+      // o upsert não cobrir por alguma razão de versão do Supabase
+      if (error.code === '23505') {
+        logger.info(`⏭️  Vela já existe no banco (23505): ${rodadaId}`)
+      } else {
         logger.error(`❌ Erro Supabase: ${error.message}`)
+        // Remove do set para permitir retry em falhas reais
+        insertedRodadaIds.delete(rodadaId)
       }
     } else {
       logger.info(`✅ Vela salva: ${candle.multiplicador}x`)
     }
   } catch (err: any) {
     logger.error(`💥 Falha crítica ao salvar vela: ${err.message}`)
+    insertedRodadaIds.delete(rodadaId)
   }
 }

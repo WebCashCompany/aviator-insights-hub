@@ -18,8 +18,25 @@ type Ordenacao = 'recent' | 'asc' | 'desc'
 type TabView   = 'grade' | 'lista'
 type Limite    = number
 
+// ─── CHAVE DE DEDUPLICAÇÃO ────────────────────────────────────────────────────
+// Problema anterior: usava `id` (UUID interno do addCandle) como chave.
+// O Supabase gera um UUID diferente para o mesmo registro → dois UUIDs distintos
+// para a mesma vela → dedup falha → tudo duplicado.
+//
+// Solução: usar `rodada_id` como chave primária de dedup.
+// rodada_id é gerado pelo backend e é o mesmo tanto no broadcast WS quanto no DB.
+// Fallback: mult + bucket de tempo de 15s (cobre casos sem rodada_id).
+function dedupKey(c: Candle): string {
+  const rid = (c as any).rodada_id
+  if (rid) return `rid_${rid}`
+  // Fallback por valor + janela de 15s
+  const ts = (c.created_at || (c as any).timestamp || '') as string
+  const bucket = Math.floor(new Date(ts).getTime() / 15_000)
+  return `mult_${Number(c.multiplicador).toFixed(2)}_${bucket}`
+}
+
 function VelaCard({ candle, isNew }: { candle: Candle; isNew: boolean }) {
-  const ts = candle.created_at || candle.timestamp
+  const ts = (candle.created_at || (candle as any).timestamp) as string
   const bgMap: Record<Candle['cor'], string> = {
     blue:   'bg-blue-500/10   border-blue-500/25   hover:border-blue-400/60',
     purple: 'bg-purple-500/10 border-purple-500/25 hover:border-purple-400/60',
@@ -65,33 +82,29 @@ function CorBadge({ cor }: { cor: Candle['cor'] }) {
 
 export default function HistoryPage() {
   const { candles: wsCandles } = useWS()
-
-  // ── Filtro de quantidade (últimas N velas) ─────────────────────────────────
   const [limite, setLimite] = useState<Limite>(1000)
-
-  // ── Busca tudo do banco; o corte acontece APÓS o merge com WS ─────────────
   const { candles: dbCandles, loading } = useCandles({ limit: 5000 })
 
-  // ── Merge: banco + WebSocket, sem duplicatas ───────────────────────────────
+  // ── Merge DB + WS sem duplicatas ───────────────────────────────────────────
+  // Banco tem prioridade (fonte da verdade).
+  // WS só entra se não existir rodada_id equivalente no banco.
   const candles = useMemo<Candle[]>(() => {
     const wsArr = Array.isArray(wsCandles) ? wsCandles : []
-
-    const key = (c: any) => {
-      const bucket = Math.floor(new Date(c.created_at || c.timestamp).getTime() / 3000)
-      return `${Number(c.multiplicador).toFixed(2)}_${bucket}`
-    }
-
     const map = new Map<string, Candle>()
-    for (const c of dbCandles) map.set(key(c), c as Candle)
-    for (const c of wsArr) { if (!map.has(key(c))) map.set(key(c), c) }
+
+    for (const c of dbCandles)  map.set(dedupKey(c as Candle), c as Candle)
+    for (const c of wsArr) {
+      const k = dedupKey(c)
+      if (!map.has(k)) map.set(k, c)
+    }
 
     return Array.from(map.values())
       .sort((a, b) => {
-        const ta = new Date((a.created_at || a.timestamp) as string).getTime()
-        const tb = new Date((b.created_at || b.timestamp) as string).getTime()
-        return tb - ta // mais recente primeiro
+        const ta = new Date(((a.created_at || (a as any).timestamp) as string)).getTime()
+        const tb = new Date(((b.created_at || (b as any).timestamp) as string)).getTime()
+        return tb - ta
       })
-      .slice(0, limite) // garante o limite após o merge com WS
+      .slice(0, limite)
   }, [dbCandles, wsCandles, limite])
 
   const [filtro, setFiltro]       = useState<Filtro>('all')
@@ -108,7 +121,7 @@ export default function HistoryPage() {
     const curr = wsCandles.length
     if (curr > prevLen.current) {
       const recentes = wsCandles.slice(prevLen.current)
-      const ids = new Set(recentes.map((c) => c.id))
+      const ids = new Set(recentes.map(c => dedupKey(c)))
       setNovosIds(ids)
       const t = setTimeout(() => setNovosIds(new Set()), 500)
       prevLen.current = curr
@@ -135,9 +148,8 @@ export default function HistoryPage() {
 
   const onIntersect = useCallback(
     (entries: IntersectionObserverEntry[]) => {
-      if (entries[0].isIntersecting && visivel < filtered.length) {
+      if (entries[0].isIntersecting && visivel < filtered.length)
         setVisivel((v) => Math.min(v + LOAD_MORE, filtered.length))
-      }
     },
     [visivel, filtered.length]
   )
@@ -150,7 +162,6 @@ export default function HistoryPage() {
     return () => obs.disconnect()
   }, [onIntersect])
 
-  // Para stats, precisamos da ordem cronológica (mais antiga primeiro)
   const candlesAsc = useMemo(() => [...candles].reverse(), [candles])
   const stats   = useMemo(() => (candlesAsc.length ? calcularStats(candlesAsc) : null), [candlesAsc])
   const padroes = useMemo(() => detectarPadroes(candlesAsc), [candlesAsc])
@@ -163,7 +174,6 @@ export default function HistoryPage() {
     blue: 'text-blue-400', purple: 'text-purple-400', pink: 'text-pink-400',
   }
 
-  // ── Loading state ──────────────────────────────────────────────────────────
   if (loading) {
     return (
       <div className="flex flex-col items-center justify-center min-h-[60vh] gap-3 text-muted-foreground">
@@ -213,9 +223,7 @@ export default function HistoryPage() {
             const v = Math.min(1000, Math.max(1, parseInt(raw)))
             setLimite(v)
           }}
-          onBlur={(e) => {
-            if (e.target.value === '') setLimite(100)
-          }}
+          onBlur={(e) => { if (e.target.value === '') setLimite(100) }}
           placeholder="outro"
           className={`w-14 px-2 py-1 rounded-lg text-xs border bg-muted/40 placeholder:text-muted-foreground/50 focus:outline-none transition-all appearance-none [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none ${
             ![50, 100, 200, 500, 1000].includes(limite)
@@ -223,9 +231,7 @@ export default function HistoryPage() {
               : 'border-transparent text-muted-foreground hover:border-border'
           }`}
         />
-        <span className="text-xs text-muted-foreground ml-auto">
-          {candles.length} velas no total
-        </span>
+        <span className="text-xs text-muted-foreground ml-auto">{candles.length} velas no total</span>
       </div>
 
       {/* ── Cards de Resumo ── */}
@@ -384,7 +390,11 @@ export default function HistoryPage() {
               style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(64px, 1fr))' }}
             >
               {visivelSlice.map((candle) => (
-                <VelaCard key={candle.id} candle={candle} isNew={novosIds.has(candle.id)} />
+                <VelaCard
+                  key={dedupKey(candle)}
+                  candle={candle}
+                  isNew={novosIds.has(dedupKey(candle))}
+                />
               ))}
             </div>
           )}
@@ -412,13 +422,13 @@ export default function HistoryPage() {
               </thead>
               <tbody>
                 {visivelSlice.map((candle) => {
-                  const ts = candle.created_at || candle.timestamp
+                  const ts = (candle.created_at || (candle as any).timestamp) as string
                   const multColor: Record<Candle['cor'], string> = {
                     blue: 'text-blue-400', purple: 'text-purple-400', pink: 'text-pink-400',
                   }
                   return (
                     <tr
-                      key={candle.id}
+                      key={dedupKey(candle)}
                       className="border-b border-border/50 last:border-none hover:bg-muted/30 transition-colors"
                     >
                       <td className="px-3 py-2 text-muted-foreground font-mono">{formatHora(ts)}</td>
@@ -427,7 +437,7 @@ export default function HistoryPage() {
                       </td>
                       <td className="px-3 py-2"><CorBadge cor={candle.cor} /></td>
                     </tr>
-                  ) 
+                  )
                 })}
               </tbody>
             </table>
