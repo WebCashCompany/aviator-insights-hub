@@ -36,6 +36,25 @@ function apiFetch(url: string, options: RequestInit = {}): Promise<Response> {
 
 const GAME_LINK = 'https://d3c6klm.com/game/action/6770'
 
+// ─── Normalização de cores ────────────────────────────────────────────────────
+// CORREÇÃO PRINCIPAL: O campo `cor` pode vir com nomes em inglês (DB) ou
+// português (WebSocket), causando falhas nas comparações e streaks erradas.
+// Esta função garante que a cor seja sempre normalizada antes de comparar.
+type NormalizedColor = 'blue' | 'purple' | 'pink' | 'unknown'
+
+function normalizeColor(cor: unknown): NormalizedColor {
+  const c = String(cor ?? '').toLowerCase().trim()
+  if (c === 'blue'   || c === 'azul')                          return 'blue'
+  if (c === 'purple' || c === 'roxa' || c === 'roxo' || c === 'violeta') return 'purple'
+  if (c === 'pink'   || c === 'rosa')                          return 'pink'
+  return 'unknown'
+}
+
+/** Retorna a cor normalizada de uma vela */
+const candleCor = (c: Candle): NormalizedColor => normalizeColor(c.cor)
+const isBlueCandle   = (c: Candle): boolean => candleCor(c) === 'blue'
+const isPurpleCandle = (c: Candle): boolean => candleCor(c) === 'purple'
+
 // ─── Tipos ────────────────────────────────────────────────────────────────────
 interface SignalResult { tipo: 'entrar' | 'aguardar' | 'bloqueado' | 'pre_sinal'; msg: string; color: string }
 interface StratStats { wins: number; losses: number; g1: number; g2: number; loss: number; winRate: number; total: number }
@@ -53,7 +72,6 @@ interface TradeState {
   entryCandles: number
   stratName: string
   preSignalStreak: number
-  // índice da vela de entrada no array `candles` (para pegar o resultado correto)
   entryCandleIndex: number
 }
 
@@ -65,20 +83,37 @@ const MARKET_ALERT_COOLDOWN   = 10 * 60 * 1000
 function bluePercent(candles: Candle[], n = MARKET_WINDOW): number {
   if (!candles.length) return 0
   const slice = candles.slice(-n)
-  return slice.filter(c => c.cor === 'blue').length / slice.length
+  // USA isBlueCandle() para normalização — evita contar 'azul' como não-azul
+  return slice.filter(isBlueCandle).length / slice.length
 }
 
 function isMarketPaying(candles: Candle[]): boolean {
   return bluePercent(candles, MARKET_WINDOW) < MARKET_PAYING_THRESHOLD
 }
 
+/**
+ * Conta quantas velas AZUIS consecutivas existem no FINAL do array.
+ * Usa normalizeColor para aceitar 'blue' e 'azul' indistintamente.
+ * Qualquer vela não-azul (roxa, rosa, unknown) interrompe a sequência.
+ */
 function currentBlueStreak(candles: Candle[]): number {
   let streak = 0
   for (let i = candles.length - 1; i >= 0; i--) {
-    if (candles[i].cor === 'blue') streak++
+    if (isBlueCandle(candles[i])) streak++
     else break
   }
   return streak
+}
+
+// ─── Chave de deduplicação confiável ─────────────────────────────────────────
+function candleKey(c: any): string {
+  if (c.id != null && c.id !== '') return `id_${c.id}`
+  const ts = c.created_at || c.timestamp
+  if (ts) {
+    const bucket = Math.floor(new Date(ts).getTime() / 1000)
+    return `ts_${bucket}_${Number(c.multiplicador).toFixed(4)}`
+  }
+  return `mult_${Number(c.multiplicador).toFixed(4)}`
 }
 
 // ─── Backtesting ──────────────────────────────────────────────────────────────
@@ -89,10 +124,12 @@ function computeStats(strategy: StrategyDef, candles: Candle[]): StratStats {
     let idx = 4
     while (idx < candles.length - 2) {
       const c = candles[idx]
-      if (c.cor === 'purple') {
+      // CORREÇÃO: usa isPurpleCandle() para aceitar 'purple' e 'roxa'
+      if (isPurpleCandle(c)) {
         let streak = 0
         for (let j = idx - 1; j >= 0; j--) {
-          if (candles[j].cor === 'blue') streak++
+          // CORREÇÃO: usa isBlueCandle() para aceitar 'blue' e 'azul'
+          if (isBlueCandle(candles[j])) streak++
           else break
         }
         if (streak === 2 || streak === 4) {
@@ -145,8 +182,9 @@ function buildStrategies(config: Record<string, string>): StrategyDef[] {
       icon: <Clock className="h-4 w-4" />,
       configFields: [{ key: 'tolerancia', label: 'Tolerância (min)', type: 'number', defaultValue: '1' }],
       detectSignal(candles) {
+        // CORREÇÃO: usa isPurpleCandle() na filtragem
         const purples = candles
-          .filter(c => c.cor === 'purple' && c.created_at)
+          .filter(c => isPurpleCandle(c) && c.created_at)
           .sort((a, b) => new Date(a.created_at!).getTime() - new Date(b.created_at!).getTime())
         if (purples.length < 3) return { tipo: 'aguardar', msg: 'Poucas roxas para calcular intervalo', color: C.muted }
         const intervals: number[] = []
@@ -173,36 +211,49 @@ function buildStrategies(config: Record<string, string>): StrategyDef[] {
       icon: <Zap className="h-4 w-4" />,
       detectSignal(candles) {
         if (candles.length < 4) return null
+
         const bluePct   = bluePercent(candles, MARKET_WINDOW)
         const mercadoOk = bluePct < MARKET_PAYING_THRESHOLD
         if (!mercadoOk) return { tipo: 'bloqueado', msg: `Mercado não pagando (${(bluePct * 100).toFixed(1)}% azuis) — sinal bloqueado`, color: C.amber }
-        const last = candles[candles.length - 1]
-        if (last?.cor === 'purple') {
+
+        const last    = candles[candles.length - 1]
+        const lastCor = candleCor(last)
+
+        // ── Última vela é ROXA: conta azuis consecutivas imediatamente antes ──
+        if (lastCor === 'purple') {
           let streak = 0
           for (let i = candles.length - 2; i >= 0; i--) {
-            if (candles[i].cor === 'blue') streak++
+            // CORREÇÃO: só conta velas AZUIS; roxa/rosa/unknown interrompem
+            if (isBlueCandle(candles[i])) streak++
             else break
           }
+
           if (streak === 2 || streak === 4)
-            return { tipo: 'entrar', msg: `🚀 ENTRADA CONFIRMADA — roxa após ${streak} azuis! Entre na PRÓXIMA vela!`, color: C.green }
+            return { tipo: 'entrar', msg: `🚀 ENTRADA CONFIRMADA — roxa após ${streak} azul${streak === 1 ? '' : 'is'}! Entre na PRÓXIMA vela!`, color: C.green }
           if (streak === 3)
             return { tipo: 'bloqueado', msg: `Roxa veio após 3 azuis — padrão inválido (precisa exatamente 2 ou 4)`, color: C.amber }
           if (streak < 2)
             return { tipo: 'bloqueado', msg: `Roxa veio, mas só ${streak} azul${streak === 1 ? '' : 'is'} antes — precisa exatamente 2 ou 4`, color: C.amber }
           return { tipo: 'bloqueado', msg: `Roxa veio após ${streak} azuis — passou do limite (máximo 4)`, color: C.amber }
         }
-        if (last?.cor === 'blue') {
+
+        // ── Última vela é AZUL: conta a sequência atual de azuis ──
+        if (lastCor === 'blue') {
+          // CORREÇÃO: usa isBlueCandle() para contagem robusta
           let bluesNow = 0
           for (let i = candles.length - 1; i >= 0; i--) {
-            if (candles[i].cor === 'blue') bluesNow++
+            if (isBlueCandle(candles[i])) bluesNow++
             else break
           }
-          if (bluesNow > 4)  return { tipo: 'bloqueado', msg: `${bluesNow} azuis seguidas — passou do limite, ignorar próxima roxa`, color: C.amber }
+
+          if (bluesNow > 4)   return { tipo: 'bloqueado', msg: `${bluesNow} azuis seguidas — passou do limite, ignorar próxima roxa`, color: C.amber }
           if (bluesNow === 4) return { tipo: 'pre_sinal', msg: `⚠️ PRÉ-SINAL — 4 azuis seguidas! Aguardando roxa para confirmar entrada`, color: C.amber }
           if (bluesNow === 3) return { tipo: 'aguardar', msg: `3 azuis — se vier mais 1 azul (total 4) prepare-se. Aguardando...`, color: C.muted }
           if (bluesNow === 2) return { tipo: 'pre_sinal', msg: `⚠️ PRÉ-SINAL — 2 azuis seguidas! Aguardando roxa para confirmar entrada`, color: C.amber }
           return { tipo: 'aguardar', msg: 'Aguardando 2 ou 4 azuis seguidas...', color: C.muted }
         }
+
+        // ── Última vela é ROSA ou desconhecida: reseta ──
         return { tipo: 'aguardar', msg: 'Padrão resetado — aguardando nova sequência de azuis...', color: C.muted }
       },
     },
@@ -359,18 +410,20 @@ export default function StrategiesPage() {
   const [limit, setLimit] = useState<LimitOption>(1000)
   const { candles: dbCandles } = useCandles({ limit: 5000 })
 
+  // ── Merge DB + WS com deduplicação confiável via candleKey ────────────────
   const candles = useMemo<Candle[]>(() => {
     const wsArr = Array.isArray(wsCandles) ? wsCandles : []
-    const key = (c: any) => {
-      const bucket = Math.floor(new Date(c.created_at || c.timestamp).getTime() / 3000)
-      return `${Number(c.multiplicador).toFixed(2)}_${bucket}`
-    }
     const map = new Map<string, Candle>()
-    for (const c of dbCandles) map.set(key(c), c as Candle)
-    for (const c of wsArr) { if (!map.has(key(c))) map.set(key(c), c) }
+    for (const c of dbCandles) map.set(candleKey(c), c as Candle)
+    for (const c of wsArr) {
+      const k = candleKey(c)
+      if (!map.has(k)) map.set(k, c)
+    }
     return Array.from(map.values())
-      .sort((a, b) => new Date((a.created_at || a.timestamp) as string).getTime()
-                    - new Date((b.created_at || b.timestamp) as string).getTime())
+      .sort((a, b) =>
+        new Date((a.created_at || a.timestamp) as string).getTime() -
+        new Date((b.created_at || b.timestamp) as string).getTime()
+      )
       .slice(-limit)
   }, [dbCandles, wsCandles, limit])
 
@@ -537,15 +590,13 @@ export default function StrategiesPage() {
     const trade = tradeRef.current
 
     // ─── helper: resolve resultado e envia WPP ────────────────────────────
-    // Usa o índice da vela gravado no momento da entrada para pegar
-    // exatamente a vela certa (não sofre distorção se o array cresceu mais de 1)
     function resolveResult(
       candleIndex: number,
       phase: 'confirmed' | 'gale',
       stratName: string,
     ) {
       const resultCandle = candles[candleIndex]
-      if (!resultCandle) return false          // vela ainda não chegou
+      if (!resultCandle) return false
       const mult   = Number(resultCandle.multiplicador)
       const isWin  = mult >= 2
 
@@ -556,7 +607,6 @@ export default function StrategiesPage() {
           setTradeDisplay({ kind: 'result', result: 'win_g1', multiplier: mult })
           setTimeout(() => setTradeDisplay({ kind: 'idle' }), 6000)
         } else {
-          // Vai para gale — registra índice da PRÓXIMA vela
           apiPost('/whatsapp/gale', { strategyName: stratName }, false)
           tradeRef.current = {
             ...trade,
@@ -567,7 +617,6 @@ export default function StrategiesPage() {
           setTradeDisplay({ kind: 'gale' })
         }
       } else {
-        // phase === 'gale'
         const result = isWin ? 'win_g2' as const : 'loss' as const
         apiPost('/whatsapp/result', { strategyName: stratName, result, multiplier: mult }, false)
         tradeRef.current = { ...INITIAL_TRADE }
@@ -578,6 +627,7 @@ export default function StrategiesPage() {
     }
 
     if (selected.id === 's_roxa_azul50') {
+      // CORREÇÃO: usa currentBlueStreak() que agora usa normalizeColor internamente
       const streak = currentBlueStreak(candles)
       const prev   = prevBlueStreak.current
       const paying = bluePercent(candles, MARKET_WINDOW) < MARKET_PAYING_THRESHOLD
@@ -600,20 +650,19 @@ export default function StrategiesPage() {
       } else if (trade.phase === 'pre_sinal') {
         if (tipo === 'entrar') {
           apiPost('/whatsapp/confirmed', { strategyName: selected.name }, true)
-          // A vela de resultado será candles.length (próxima após a atual)
           tradeRef.current = {
             ...trade,
             phase: 'confirmed',
             entryCandles: wsCandles.length,
-            entryCandleIndex: candles.length, // índice da próxima vela que vai chegar
+            entryCandleIndex: candles.length,
           }
           setTradeDisplay({ kind: 'confirmed' })
         } else if (!paying || streak > 4 || streak === 0) {
+          // Reseta se mercado parou de pagar, streak passou do limite ou foi quebrado
           tradeRef.current = { ...INITIAL_TRADE }
           setTradeDisplay({ kind: 'idle' })
         }
       } else if (trade.phase === 'confirmed') {
-        // Aguarda a vela no índice correto aparecer no array
         if (candles.length > trade.entryCandleIndex) {
           resolveResult(trade.entryCandleIndex, 'confirmed', trade.stratName)
         }
@@ -656,7 +705,7 @@ export default function StrategiesPage() {
             ...trade,
             phase: 'confirmed',
             entryCandles: wsCandles.length,
-            entryCandleIndex: candles.length, // próxima vela que chegará
+            entryCandleIndex: candles.length,
           }
           setTradeDisplay({ kind: 'confirmed' })
         }
