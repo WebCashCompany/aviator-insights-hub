@@ -48,7 +48,14 @@ interface StrategyDef {
 interface WppConfig { enabled: boolean; serverConfigured: boolean; lastSentAt: number | null; targets: string[] }
 
 type TradePhase = 'idle' | 'pre_sinal' | 'warning_sent' | 'confirmed' | 'gale'
-interface TradeState { phase: TradePhase; entryCandles: number; stratName: string; preSignalStreak: number }
+interface TradeState {
+  phase: TradePhase
+  entryCandles: number
+  stratName: string
+  preSignalStreak: number
+  // índice da vela de entrada no array `candles` (para pegar o resultado correto)
+  entryCandleIndex: number
+}
 
 // ─── MERCADO PAGANDO ──────────────────────────────────────────────────────────
 const MARKET_PAYING_THRESHOLD = 0.485
@@ -338,6 +345,14 @@ const LIMIT_OPTIONS = [50, 100, 200, 1000] as const
 type LimitOption = typeof LIMIT_OPTIONS[number]
 const DEFAULT_WPP: WppConfig = { enabled: false, serverConfigured: false, lastSentAt: null, targets: [] }
 
+const INITIAL_TRADE: TradeState = {
+  phase: 'idle',
+  entryCandles: 0,
+  stratName: '',
+  preSignalStreak: 0,
+  entryCandleIndex: -1,
+}
+
 // ─── Página Principal ─────────────────────────────────────────────────────────
 export default function StrategiesPage() {
   const { candles: wsCandles } = useWS()
@@ -364,7 +379,6 @@ export default function StrategiesPage() {
   const [wppConfig, setWppConfigRaw]   = useState<WppConfig>(DEFAULT_WPP)
   const [configLoaded, setConfigLoaded] = useState(false)
 
-  // Carrega config do backend ao montar
   useEffect(() => {
     apiFetch(`${API_BASE}/bot/config`)
       .then(r => r.json())
@@ -376,7 +390,6 @@ export default function StrategiesPage() {
       .catch(() => setConfigLoaded(true))
   }, [])
 
-  // Salva selectedId no backend sempre que mudar (após carregamento inicial)
   const setSelectedId = useCallback((id: string | null) => {
     setSelectedIdRaw(id)
     apiFetch(`${API_BASE}/bot/config`, {
@@ -386,11 +399,9 @@ export default function StrategiesPage() {
     }).catch(() => {})
   }, [])
 
-  // Salva wppConfig (enabled + targets) no backend sempre que mudar
   const updateWppConfig = useCallback((partial: Partial<WppConfig>) => {
     setWppConfigRaw(prev => {
       const next = { ...prev, ...partial }
-      // Só persiste enabled e selectedStratId — targets já são salvos pelo endpoint /whatsapp/targets
       if (partial.enabled !== undefined) {
         apiFetch(`${API_BASE}/bot/config`, {
           method:  'POST',
@@ -404,7 +415,7 @@ export default function StrategiesPage() {
 
   const [stratConfig, setStratConfig] = useState<Record<string, string>>({})
 
-  const tradeRef       = useRef<TradeState>({ phase: 'idle', entryCandles: 0, stratName: '', preSignalStreak: 0 })
+  const tradeRef       = useRef<TradeState>({ ...INITIAL_TRADE })
   const prevBlueStreak = useRef<number>(-1)
   const prevTipoRef    = useRef<string | null>(null)
   const lastTotalCount = useRef<number>(-1)
@@ -525,6 +536,47 @@ export default function StrategiesPage() {
     const tipo  = sinalAtual?.tipo ?? null
     const trade = tradeRef.current
 
+    // ─── helper: resolve resultado e envia WPP ────────────────────────────
+    // Usa o índice da vela gravado no momento da entrada para pegar
+    // exatamente a vela certa (não sofre distorção se o array cresceu mais de 1)
+    function resolveResult(
+      candleIndex: number,
+      phase: 'confirmed' | 'gale',
+      stratName: string,
+    ) {
+      const resultCandle = candles[candleIndex]
+      if (!resultCandle) return false          // vela ainda não chegou
+      const mult   = Number(resultCandle.multiplicador)
+      const isWin  = mult >= 2
+
+      if (phase === 'confirmed') {
+        if (isWin) {
+          apiPost('/whatsapp/result', { strategyName: stratName, result: 'win_g1', multiplier: mult }, false)
+          tradeRef.current = { ...INITIAL_TRADE }
+          setTradeDisplay({ kind: 'result', result: 'win_g1', multiplier: mult })
+          setTimeout(() => setTradeDisplay({ kind: 'idle' }), 6000)
+        } else {
+          // Vai para gale — registra índice da PRÓXIMA vela
+          apiPost('/whatsapp/gale', { strategyName: stratName }, false)
+          tradeRef.current = {
+            ...trade,
+            phase: 'gale',
+            entryCandles: wsCandles.length,
+            entryCandleIndex: candleIndex + 1,
+          }
+          setTradeDisplay({ kind: 'gale' })
+        }
+      } else {
+        // phase === 'gale'
+        const result = isWin ? 'win_g2' as const : 'loss' as const
+        apiPost('/whatsapp/result', { strategyName: stratName, result, multiplier: mult }, false)
+        tradeRef.current = { ...INITIAL_TRADE }
+        setTradeDisplay({ kind: 'result', result, multiplier: mult })
+        setTimeout(() => setTradeDisplay({ kind: 'idle' }), 6000)
+      }
+      return true
+    }
+
     if (selected.id === 's_roxa_azul50') {
       const streak = currentBlueStreak(candles)
       const prev   = prevBlueStreak.current
@@ -536,40 +588,38 @@ export default function StrategiesPage() {
         const chegouEm4 = streak === 4 && prev !== 4
         if (chegouEm2 || chegouEm4) {
           apiPost('/whatsapp/warning', { strategyName: selected.name }, true)
-          tradeRef.current = { phase: 'pre_sinal', entryCandles: wsCandles.length, stratName: selected.name, preSignalStreak: streak }
+          tradeRef.current = {
+            phase: 'pre_sinal',
+            entryCandles: wsCandles.length,
+            stratName: selected.name,
+            preSignalStreak: streak,
+            entryCandleIndex: -1,
+          }
           setTradeDisplay({ kind: 'pre_sinal' })
         }
       } else if (trade.phase === 'pre_sinal') {
         if (tipo === 'entrar') {
           apiPost('/whatsapp/confirmed', { strategyName: selected.name }, true)
-          tradeRef.current = { ...trade, phase: 'confirmed', entryCandles: wsCandles.length }
+          // A vela de resultado será candles.length (próxima após a atual)
+          tradeRef.current = {
+            ...trade,
+            phase: 'confirmed',
+            entryCandles: wsCandles.length,
+            entryCandleIndex: candles.length, // índice da próxima vela que vai chegar
+          }
           setTradeDisplay({ kind: 'confirmed' })
         } else if (!paying || streak > 4 || streak === 0) {
-          tradeRef.current = { phase: 'idle', entryCandles: 0, stratName: '', preSignalStreak: 0 }
+          tradeRef.current = { ...INITIAL_TRADE }
           setTradeDisplay({ kind: 'idle' })
         }
       } else if (trade.phase === 'confirmed') {
-        if (wsCandles.length > trade.entryCandles) {
-          const mult = Number(candles[candles.length - 1].multiplicador)
-          if (mult >= 2) {
-            apiPost('/whatsapp/result', { strategyName: selected.name, result: 'win_g1', multiplier: mult }, false)
-            tradeRef.current = { phase: 'idle', entryCandles: 0, stratName: '', preSignalStreak: 0 }
-            setTradeDisplay({ kind: 'result', result: 'win_g1', multiplier: mult })
-            setTimeout(() => setTradeDisplay({ kind: 'idle' }), 6000)
-          } else {
-            apiPost('/whatsapp/gale', { strategyName: selected.name }, false)
-            tradeRef.current = { ...trade, phase: 'gale', entryCandles: wsCandles.length }
-            setTradeDisplay({ kind: 'gale' })
-          }
+        // Aguarda a vela no índice correto aparecer no array
+        if (candles.length > trade.entryCandleIndex) {
+          resolveResult(trade.entryCandleIndex, 'confirmed', trade.stratName)
         }
       } else if (trade.phase === 'gale') {
-        if (wsCandles.length > trade.entryCandles) {
-          const mult   = Number(candles[candles.length - 1].multiplicador)
-          const result = mult >= 2 ? 'win_g2' as const : 'loss' as const
-          apiPost('/whatsapp/result', { strategyName: selected.name, result, multiplier: mult }, false)
-          tradeRef.current = { phase: 'idle', entryCandles: 0, stratName: '', preSignalStreak: 0 }
-          setTradeDisplay({ kind: 'result', result, multiplier: mult })
-          setTimeout(() => setTradeDisplay({ kind: 'idle' }), 6000)
+        if (candles.length > trade.entryCandleIndex) {
+          resolveResult(trade.entryCandleIndex, 'gale', trade.stratName)
         }
       }
 
@@ -580,7 +630,7 @@ export default function StrategiesPage() {
 
       if (!paying) {
         if (trade.phase !== 'idle') {
-          tradeRef.current = { phase: 'idle', entryCandles: 0, stratName: '', preSignalStreak: 0 }
+          tradeRef.current = { ...INITIAL_TRADE }
           setTradeDisplay({ kind: 'idle' })
         }
         prevTipoRef.current = tipo
@@ -590,37 +640,33 @@ export default function StrategiesPage() {
       if (trade.phase === 'idle') {
         if (prevTipoRef.current !== 'entrar' && tipo === 'entrar') {
           apiPost('/whatsapp/warning', { strategyName: selected.name }, true)
-          tradeRef.current = { phase: 'warning_sent', entryCandles: wsCandles.length, stratName: selected.name, preSignalStreak: 0 }
+          tradeRef.current = {
+            phase: 'warning_sent',
+            entryCandles: wsCandles.length,
+            stratName: selected.name,
+            preSignalStreak: 0,
+            entryCandleIndex: -1,
+          }
           setTradeDisplay({ kind: 'warning' })
         }
       } else if (trade.phase === 'warning_sent') {
         if (wsCandles.length > trade.entryCandles) {
           apiPost('/whatsapp/confirmed', { strategyName: selected.name }, true)
-          tradeRef.current = { ...trade, phase: 'confirmed', entryCandles: wsCandles.length }
+          tradeRef.current = {
+            ...trade,
+            phase: 'confirmed',
+            entryCandles: wsCandles.length,
+            entryCandleIndex: candles.length, // próxima vela que chegará
+          }
           setTradeDisplay({ kind: 'confirmed' })
         }
       } else if (trade.phase === 'confirmed') {
-        if (wsCandles.length > trade.entryCandles) {
-          const mult = Number(candles[candles.length - 1].multiplicador)
-          if (mult >= 2) {
-            apiPost('/whatsapp/result', { strategyName: selected.name, result: 'win_g1', multiplier: mult }, false)
-            tradeRef.current = { phase: 'idle', entryCandles: 0, stratName: '', preSignalStreak: 0 }
-            setTradeDisplay({ kind: 'result', result: 'win_g1', multiplier: mult })
-            setTimeout(() => setTradeDisplay({ kind: 'idle' }), 6000)
-          } else {
-            apiPost('/whatsapp/gale', { strategyName: selected.name }, false)
-            tradeRef.current = { ...trade, phase: 'gale', entryCandles: wsCandles.length }
-            setTradeDisplay({ kind: 'gale' })
-          }
+        if (candles.length > trade.entryCandleIndex) {
+          resolveResult(trade.entryCandleIndex, 'confirmed', trade.stratName)
         }
       } else if (trade.phase === 'gale') {
-        if (wsCandles.length > trade.entryCandles) {
-          const mult   = Number(candles[candles.length - 1].multiplicador)
-          const result = mult >= 2 ? 'win_g2' as const : 'loss' as const
-          apiPost('/whatsapp/result', { strategyName: selected.name, result, multiplier: mult }, false)
-          tradeRef.current = { phase: 'idle', entryCandles: 0, stratName: '', preSignalStreak: 0 }
-          setTradeDisplay({ kind: 'result', result, multiplier: mult })
-          setTimeout(() => setTradeDisplay({ kind: 'idle' }), 6000)
+        if (candles.length > trade.entryCandleIndex) {
+          resolveResult(trade.entryCandleIndex, 'gale', trade.stratName)
         }
       }
 
@@ -629,7 +675,7 @@ export default function StrategiesPage() {
   }, [candles, wsCandles, sinalAtual, wppConfig.enabled, selected, apiPost])
 
   useEffect(() => {
-    tradeRef.current       = { phase: 'idle', entryCandles: 0, stratName: '', preSignalStreak: 0 }
+    tradeRef.current       = { ...INITIAL_TRADE }
     prevBlueStreak.current = -1
     prevTipoRef.current    = null
     lastTotalCount.current = -1
@@ -637,7 +683,6 @@ export default function StrategiesPage() {
   }, [selectedId])
 
   // ─── Render ──────────────────────────────────────────────────────────────────
-  // Aguarda carregar config do backend antes de renderizar para evitar flash
   if (!configLoaded) {
     return (
       <div className="flex items-center justify-center py-20">

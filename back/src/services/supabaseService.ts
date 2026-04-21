@@ -1,6 +1,6 @@
+// supabaseService.ts — COMPLETO
 import { createClient } from '@supabase/supabase-js'
 import { logger } from '../utils/logger.js'
-import { Candle } from '../types/index.js'
 
 const supabase = createClient(
   process.env.SUPABASE_URL!,
@@ -9,46 +9,33 @@ const supabase = createClient(
 )
 
 let resolvedUserId: string | null = null
-
-// ─── SET LOCAL: garante que nenhum rodada_id é inserido 2x nesta sessão ──────
-// Mesmo que o candleService falhe ou o burst chegue em paralelo,
-// este set é a última barreira antes do INSERT.
 const insertedRodadaIds = new Set<string>()
 
-export async function initBotUser(): Promise<void> {
+// ─── Init ─────────────────────────────────────────────────────────────────────
+export async function initBotUser() {
   const email = process.env.BET923_EMAIL
-
-  if (!email) {
-    logger.error('❌ BET923_EMAIL não definido no .env')
-    return
-  }
+  if (!email) return logger.error('❌ BET923_EMAIL não definido no .env')
 
   try {
-    const { data, error } = await supabase.auth.admin.listUsers()
-
-    if (error) {
-      logger.error(`❌ Erro ao listar usuários: ${error.message}`)
-      return
-    }
-
+    const { data } = await supabase.auth.admin.listUsers()
     const user = data.users.find(u => u.email === email)
 
     if (!user) {
-      logger.error(`❌ Nenhum usuário encontrado com email: ${email}`)
+      logger.error(`❌ Usuário não encontrado: ${email}`)
       return
     }
 
     resolvedUserId = user.id
-    logger.info(`✅ Bot vinculado ao usuário: ${email} (user_id: ${resolvedUserId})`)
-
     insertedRodadaIds.clear()
     await clearCandles()
+    logger.info(`✅ Bot vinculado ao usuário: ${email}`)
   } catch (err: any) {
-    logger.error(`💥 Erro crítico ao buscar usuário: ${err.message}`)
+    logger.error(`💥 Erro crítico no init: ${err.message}`)
   }
 }
 
-async function clearCandles(): Promise<void> {
+// ─── Limpa banco ──────────────────────────────────────────────────────────────
+export async function clearCandles() {
   if (!resolvedUserId) return
   try {
     const { error, count } = await supabase
@@ -56,67 +43,59 @@ async function clearCandles(): Promise<void> {
       .delete({ count: 'exact' })
       .eq('user_id', resolvedUserId)
 
-    if (error) {
-      logger.error(`❌ Erro ao limpar velas: ${error.message}`)
-    } else {
-      logger.info(`🧹 Banco limpo: ${count ?? 0} vela(s) removida(s)`)
-    }
+    if (!error) logger.info(`🧹 Banco limpo: ${count ?? 0} vela(s) removida(s)`)
   } catch (err: any) {
-    logger.error(`💥 Falha ao limpar banco: ${err.message}`)
+    logger.error(`💥 Falha ao limpar: ${err.message}`)
   }
 }
 
-export async function saveCandle(candle: Candle): Promise<void> {
-  if (!resolvedUserId) {
-    logger.warn('⚠️  user_id não resolvido — vela não salva')
+// ─── Salva vela ───────────────────────────────────────────────────────────────
+// Sem Barreira 2 — ela estava com janela errada e não funcionava.
+// O banco é limpo a cada restart, então não há risco de duplicata entre sessões.
+// A única deduplicação necessária é:
+//   Barreira 1: memória síncrona (insertedRodadaIds) — evita double-fire na mesma sessão
+//   Barreira 3: upsert com ignoreDuplicates — defesa final no banco
+export async function saveCandle(candle: any) {
+  if (!resolvedUserId) return
+
+  if (!candle.rodada_id) {
+    logger.warn(`⚠️  Vela sem rodada_id ignorada: ${candle.multiplicador}x`)
     return
   }
 
-  const rodadaId = candle.rodada_id ?? `fallback_${candle.multiplicador.toFixed(2)}_${Date.now()}`
-
-  // ─── BARREIRA 1: set em memória (síncrono, zero latência) ────────────────
-  if (insertedRodadaIds.has(rodadaId)) {
-    logger.info(`⏭️  saveCandle ignorado (já inserido nesta sessão): ${rodadaId}`)
-    return
-  }
-  insertedRodadaIds.add(rodadaId)
+  // Barreira 1: memória síncrona
+  if (insertedRodadaIds.has(candle.rodada_id)) return
+  insertedRodadaIds.add(candle.rodada_id)
 
   try {
-    // ─── BARREIRA 2: upsert com onConflict em rodada_id ──────────────────
-    // Se o banco tiver constraint UNIQUE em (user_id, rodada_id),
-    // conflitos são silenciosamente ignorados — zero duplicata no banco.
-    // Se não tiver a constraint ainda, o insert normal ocorre mas a
-    // barreira 1 já cobre 99% dos casos desta sessão.
     const { error } = await supabase.from('candles').upsert(
       {
-        user_id:      resolvedUserId,
+        user_id:       resolvedUserId,
         multiplicador: candle.multiplicador,
         cor:           candle.cor,
-        rodada_id:     rodadaId,
+        rodada_id:     candle.rodada_id,
         fonte:         'auto',
-        created_at:    new Date().toISOString(),
+        timestamp:     candle.timestamp || new Date().toISOString(),
       },
-      {
-        onConflict:        'user_id,rodada_id',  // requer constraint UNIQUE no banco
-        ignoreDuplicates:  true,                 // não lança erro, apenas ignora
-      }
+      { onConflict: 'user_id,rodada_id', ignoreDuplicates: true }
     )
 
     if (error) {
-      // 23505 = unique_violation — pode chegar se a constraint existir e
-      // o upsert não cobrir por alguma razão de versão do Supabase
-      if (error.code === '23505') {
-        logger.info(`⏭️  Vela já existe no banco (23505): ${rodadaId}`)
-      } else {
-        logger.error(`❌ Erro Supabase: ${error.message}`)
-        // Remove do set para permitir retry em falhas reais
-        insertedRodadaIds.delete(rodadaId)
-      }
+      if (error.code === '23505') return
+      logger.error(`❌ Erro Supabase: ${error.message}`)
+      insertedRodadaIds.delete(candle.rodada_id)
     } else {
       logger.info(`✅ Vela salva: ${candle.multiplicador}x`)
     }
   } catch (err: any) {
-    logger.error(`💥 Falha crítica ao salvar vela: ${err.message}`)
-    insertedRodadaIds.delete(rodadaId)
+    insertedRodadaIds.delete(candle.rodada_id)
+    logger.error(`💥 Falha de rede ao salvar: ${err.message}`)
   }
 }
+
+export function resetSaveState() {
+  insertedRodadaIds.clear()
+  logger.info('🔄 Estado de inserção resetado')
+}
+
+export { supabase }

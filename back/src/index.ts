@@ -1,3 +1,4 @@
+// index.ts — COMPLETO
 import 'dotenv/config'
 import express from 'express'
 import cors from 'cors'
@@ -10,14 +11,14 @@ import { navigateToAviator } from './browser/navigator.js'
 import { startInterception } from './browser/interceptor.js'
 import { setupWebSocket } from './server/websocket.js'
 import { candleService } from './services/candleService.js'
-import { initBotUser } from './services/supabaseService.js'
+import { initBotUser, resetSaveState, clearCandles } from './services/supabaseService.js'
 import { ServerStatus } from './types/index.js'
 import apiRouter from './server/api.js'
 import fs from 'fs'
 
 if (!fs.existsSync('logs')) fs.mkdirSync('logs')
 
-const app = express()
+const app    = express()
 const server = createServer(app)
 let serverStarted = false
 
@@ -27,8 +28,8 @@ app.use(cors({
     'http://localhost:3000',
     'http://localhost:8080',
     'https://aviatorpro.vercel.app',
-    'https://gory-survivor-entourage.ngrok-free.dev'
-  ]
+    'https://gory-survivor-entourage.ngrok-free.dev',
+  ],
 }))
 
 app.use((req, res, next) => {
@@ -40,13 +41,13 @@ app.use(express.json())
 app.use('/api/v1', apiRouter)
 
 let status: ServerStatus = {
-  connected: false,
-  loggedIn: false,
-  gameOpen: false,
-  totalCaptured: 0,
-  lastCandle: null,
-  uptime: 0,
-  lastError: null
+  connected:      false,
+  loggedIn:       false,
+  gameOpen:       false,
+  totalCaptured:  0,
+  lastCandle:     null,
+  uptime:         0,
+  lastError:      null,
 }
 
 const startTime = Date.now()
@@ -55,8 +56,8 @@ export function getStatus(): ServerStatus {
   return {
     ...status,
     totalCaptured: candleService.getTotalCaptured(),
-    lastCandle: candleService.getLastCandle(),
-    uptime: Math.floor((Date.now() - startTime) / 1000)
+    lastCandle:    candleService.getLastCandle(),
+    uptime:        Math.floor((Date.now() - startTime) / 1000),
   }
 }
 
@@ -77,9 +78,9 @@ async function initialize() {
     }
 
     await initBotUser()
-
     await startCapture()
 
+    // Watchdog: reinicia se ficar sem velas por mais de 5 minutos
     cron.schedule('*/2 * * * *', async () => {
       const lastCandle = candleService.getLastCandle()
       if (lastCandle) {
@@ -91,19 +92,18 @@ async function initialize() {
         }
       }
     })
-
   } catch (err) {
     logger.error(`Erro fatal na inicialização: ${err}`)
     logger.warn('🔄 Tentando reiniciar em 15 segundos...')
-    setTimeout(() => startCapture(), 15000)
+    setTimeout(() => startCapture(), 15_000)
   }
 }
 
 async function startCapture() {
   try {
     status.connected = false
-    status.loggedIn = false
-    status.gameOpen = false
+    status.loggedIn  = false
+    status.gameOpen  = false
 
     const page = await launchBrowser()
     status.connected = true
@@ -119,7 +119,6 @@ async function startCapture() {
 
     status.lastError = null
     logger.info('✅ Captura ativa! Aguardando velas...')
-
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     status.lastError = msg
@@ -131,11 +130,20 @@ async function startCapture() {
 async function restartCapture() {
   try {
     await closeBrowser()
-    await new Promise(r => setTimeout(r, 5000))
+    await new Promise(r => setTimeout(r, 5_000))
+
+    // Reseta tudo antes de reiniciar:
+    // 1. Estado de inserção do supabase (insertedRodadaIds)
+    // 2. Buffer local de velas
+    // 3. Banco limpo — evita duplicatas entre sessões
+    resetSaveState()
+    candleService.clear()
+    await clearCandles()
+
     await startCapture()
   } catch (err) {
     logger.error(`Erro ao reiniciar: ${err}`)
-    setTimeout(restartCapture, 30000)
+    setTimeout(restartCapture, 30_000)
   }
 }
 
