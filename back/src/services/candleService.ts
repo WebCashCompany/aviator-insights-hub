@@ -3,7 +3,7 @@ import { Candle } from '../types/index.js'
 import { calcularCor } from '../utils/colorCalc.js'
 import { logger } from '../utils/logger.js'
 import { EventEmitter } from 'events'
-import { alertPayingCandle, getPayThreshold, isConfigured as wppConfigured } from './whatsappService.js'
+import { alertMarketPaying, getPayThreshold, isConfigured as wppConfigured } from './whatsappService.js'
 
 const MAX_CANDLES = 1000
 
@@ -114,7 +114,7 @@ class CandleService extends EventEmitter {
     this.emit('new_candle', candle)
 
     if (wppConfigured() && multiplicador >= getPayThreshold()) {
-      alertPayingCandle(candle).catch(err =>
+      alertMarketPaying().catch(err =>
         logger.error(`[WhatsApp] Erro no alerta de pagamento: ${err.message}`)
       )
     }

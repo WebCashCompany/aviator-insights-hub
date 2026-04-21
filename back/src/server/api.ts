@@ -25,6 +25,18 @@ import {
 
 const router = express.Router()
 
+// ── Config do robô em memória (persiste enquanto o servidor estiver de pé) ─────
+// Para persistência total entre reinicializações, salve no Supabase.
+interface BotConfig {
+  enabled:          boolean
+  selectedStratId:  string | null
+}
+
+let botConfig: BotConfig = {
+  enabled:         false,
+  selectedStratId: null,
+}
+
 // ── Candles ────────────────────────────────────────────────────────────────────
 
 router.get('/status', (_req, res) => res.json(getStatus()))
@@ -53,6 +65,28 @@ router.delete('/candles', (_req, res) => {
 
 router.get('/debug/frames', (req, res) => {
   res.json(getRawFrames().slice(0, parseInt(req.query.limit as string) || 20))
+})
+
+// ── Bot Config ─────────────────────────────────────────────────────────────────
+
+/**
+ * GET /api/v1/bot/config
+ * Retorna configuração atual do robô (estratégia + toggle)
+ */
+router.get('/bot/config', (_req, res) => {
+  res.json(botConfig)
+})
+
+/**
+ * POST /api/v1/bot/config
+ * Salva configuração do robô
+ * Body: { enabled?: boolean, selectedStratId?: string | null }
+ */
+router.post('/bot/config', (req, res) => {
+  const { enabled, selectedStratId } = req.body
+  if (enabled          !== undefined) botConfig.enabled         = Boolean(enabled)
+  if (selectedStratId  !== undefined) botConfig.selectedStratId = selectedStratId ?? null
+  res.json({ ok: true, config: botConfig })
 })
 
 // ── WhatsApp — config & sinal ──────────────────────────────────────────────────
@@ -155,11 +189,6 @@ router.get('/whatsapp/contacts', (_req, res) => {
 
 // ── WhatsApp — Alertas de Mercado & Trade ─────────────────────────────────────
 
-/**
- * POST /api/v1/whatsapp/market-paying
- * Alerta de mercado favorável — sem parâmetro bluePercent,
- * a mensagem mostra qualidades positivas do gráfico.
- */
 router.post('/whatsapp/market-paying', async (req, res) => {
   const { targets } = req.body
   if (!isConfigured()) { res.status(503).json({ error: 'WhatsApp não conectado' }); return }
@@ -171,10 +200,6 @@ router.post('/whatsapp/market-paying', async (req, res) => {
   }
 })
 
-/**
- * POST /api/v1/whatsapp/warning
- * Pré-sinal — 1 vela antes da entrada
- */
 router.post('/whatsapp/warning', async (req, res) => {
   const { strategyName, targets } = req.body
   if (!strategyName) { res.status(400).json({ error: 'strategyName obrigatório' }); return }
@@ -187,10 +212,6 @@ router.post('/whatsapp/warning', async (req, res) => {
   }
 })
 
-/**
- * POST /api/v1/whatsapp/confirmed
- * Entrada confirmada — hora de entrar
- */
 router.post('/whatsapp/confirmed', async (req, res) => {
   const { strategyName, targets } = req.body
   if (!strategyName) { res.status(400).json({ error: 'strategyName obrigatório' }); return }
@@ -203,10 +224,6 @@ router.post('/whatsapp/confirmed', async (req, res) => {
   }
 })
 
-/**
- * POST /api/v1/whatsapp/gale
- * G1 perdeu — entre no Martingale (dobro da entrada)
- */
 router.post('/whatsapp/gale', async (req, res) => {
   const { strategyName, targets } = req.body
   if (!strategyName) { res.status(400).json({ error: 'strategyName obrigatório' }); return }
@@ -219,10 +236,6 @@ router.post('/whatsapp/gale', async (req, res) => {
   }
 })
 
-/**
- * POST /api/v1/whatsapp/result
- * Resultado do trade: win_g1 | win_g2 | loss
- */
 router.post('/whatsapp/result', async (req, res) => {
   const { strategyName, result, multiplier, targets } = req.body
   if (!strategyName || !result || multiplier === undefined) {

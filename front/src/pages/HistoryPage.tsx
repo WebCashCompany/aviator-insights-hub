@@ -7,11 +7,6 @@ import { calcularStats, detectarPadroes, corParaLabel } from '@/utils/candleUtil
 const INITIAL_LOAD = 60
 const LOAD_MORE = 60
 
-// ─── Bucket de 10s para deduplicação por valor+tempo ─────────────────────────
-// Reduzido de 3s para 10s pois rounds do Aviator duram ~15-60s,
-// portanto o mesmo multiplicador em menos de 10s é quase certamente duplicata.
-const DEDUP_BUCKET_MS = 10_000
-
 function formatHora(ts: string): string {
   return new Date(ts).toLocaleTimeString('pt-BR', {
     hour: '2-digit', minute: '2-digit', second: '2-digit',
@@ -23,8 +18,25 @@ type Ordenacao = 'recent' | 'asc' | 'desc'
 type TabView   = 'grade' | 'lista'
 type Limite    = number
 
+// ─── CHAVE DE DEDUPLICAÇÃO ────────────────────────────────────────────────────
+// Problema anterior: usava `id` (UUID interno do addCandle) como chave.
+// O Supabase gera um UUID diferente para o mesmo registro → dois UUIDs distintos
+// para a mesma vela → dedup falha → tudo duplicado.
+//
+// Solução: usar `rodada_id` como chave primária de dedup.
+// rodada_id é gerado pelo backend e é o mesmo tanto no broadcast WS quanto no DB.
+// Fallback: mult + bucket de tempo de 15s (cobre casos sem rodada_id).
+function dedupKey(c: Candle): string {
+  const rid = (c as any).rodada_id
+  if (rid) return `rid_${rid}`
+  // Fallback por valor + janela de 15s
+  const ts = (c.created_at || (c as any).timestamp || '') as string
+  const bucket = Math.floor(new Date(ts).getTime() / 15_000)
+  return `mult_${Number(c.multiplicador).toFixed(2)}_${bucket}`
+}
+
 function VelaCard({ candle, isNew }: { candle: Candle; isNew: boolean }) {
-  const ts = candle.created_at || candle.timestamp
+  const ts = (candle.created_at || (candle as any).timestamp) as string
   const bgMap: Record<Candle['cor'], string> = {
     blue:   'bg-blue-500/10   border-blue-500/25   hover:border-blue-400/60',
     purple: 'bg-purple-500/10 border-purple-500/25 hover:border-purple-400/60',
@@ -68,54 +80,29 @@ function CorBadge({ cor }: { cor: Candle['cor'] }) {
   )
 }
 
-// ─── Chave de deduplicação ────────────────────────────────────────────────────
-// Prioridade 1: usa o id real da vela (round_id do banco) quando disponível.
-// Prioridade 2: multiplicador + bucket de tempo de 10s como fallback.
-function dedupKey(c: Candle): string {
-  // Se o id não começa com prefixo gerado localmente, é um id real → usa direto
-  const id = (c as any).id ?? ''
-  if (id && !id.startsWith('ws_') && !id.startsWith('dom_') && !id.startsWith('hist_')) {
-    return `id_${id}`
-  }
-  // Fallback: mult + bucket de 10s
-  const ts = c.created_at || (c as any).timestamp || ''
-  const bucket = Math.floor(new Date(ts).getTime() / DEDUP_BUCKET_MS)
-  return `mult_${Number(c.multiplicador).toFixed(2)}_${bucket}`
-}
-
 export default function HistoryPage() {
   const { candles: wsCandles } = useWS()
-
-  const [limite, setLimite] = useState<Limite>(100)
-
+  const [limite, setLimite] = useState<Limite>(1000)
   const { candles: dbCandles, loading } = useCandles({ limit: 5000 })
 
-  // ── Merge: banco + WebSocket, sem duplicatas ───────────────────────────────
-  // Regra: banco tem precedência sobre WS (dados do banco são a fonte da verdade).
-  // WS só é adicionado se não existir chave equivalente no banco.
+  // ── Merge DB + WS sem duplicatas ───────────────────────────────────────────
+  // Banco tem prioridade (fonte da verdade).
+  // WS só entra se não existir rodada_id equivalente no banco.
   const candles = useMemo<Candle[]>(() => {
     const wsArr = Array.isArray(wsCandles) ? wsCandles : []
-
     const map = new Map<string, Candle>()
 
-    // 1. Insere banco primeiro (fonte da verdade)
-    for (const c of dbCandles) {
-      map.set(dedupKey(c as Candle), c as Candle)
-    }
-
-    // 2. Adiciona WS apenas se não existir chave equivalente
+    for (const c of dbCandles)  map.set(dedupKey(c as Candle), c as Candle)
     for (const c of wsArr) {
       const k = dedupKey(c)
-      if (!map.has(k)) {
-        map.set(k, c)
-      }
+      if (!map.has(k)) map.set(k, c)
     }
 
     return Array.from(map.values())
       .sort((a, b) => {
         const ta = new Date(((a.created_at || (a as any).timestamp) as string)).getTime()
         const tb = new Date(((b.created_at || (b as any).timestamp) as string)).getTime()
-        return tb - ta // mais recente primeiro
+        return tb - ta
       })
       .slice(0, limite)
   }, [dbCandles, wsCandles, limite])
@@ -134,7 +121,7 @@ export default function HistoryPage() {
     const curr = wsCandles.length
     if (curr > prevLen.current) {
       const recentes = wsCandles.slice(prevLen.current)
-      const ids = new Set(recentes.map((c) => (c as any).id ?? dedupKey(c)))
+      const ids = new Set(recentes.map(c => dedupKey(c)))
       setNovosIds(ids)
       const t = setTimeout(() => setNovosIds(new Set()), 500)
       prevLen.current = curr
@@ -161,9 +148,8 @@ export default function HistoryPage() {
 
   const onIntersect = useCallback(
     (entries: IntersectionObserverEntry[]) => {
-      if (entries[0].isIntersecting && visivel < filtered.length) {
+      if (entries[0].isIntersecting && visivel < filtered.length)
         setVisivel((v) => Math.min(v + LOAD_MORE, filtered.length))
-      }
     },
     [visivel, filtered.length]
   )
@@ -237,9 +223,7 @@ export default function HistoryPage() {
             const v = Math.min(1000, Math.max(1, parseInt(raw)))
             setLimite(v)
           }}
-          onBlur={(e) => {
-            if (e.target.value === '') setLimite(100)
-          }}
+          onBlur={(e) => { if (e.target.value === '') setLimite(100) }}
           placeholder="outro"
           className={`w-14 px-2 py-1 rounded-lg text-xs border bg-muted/40 placeholder:text-muted-foreground/50 focus:outline-none transition-all appearance-none [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none ${
             ![50, 100, 200, 500, 1000].includes(limite)
@@ -247,9 +231,7 @@ export default function HistoryPage() {
               : 'border-transparent text-muted-foreground hover:border-border'
           }`}
         />
-        <span className="text-xs text-muted-foreground ml-auto">
-          {candles.length} velas no total
-        </span>
+        <span className="text-xs text-muted-foreground ml-auto">{candles.length} velas no total</span>
       </div>
 
       {/* ── Cards de Resumo ── */}
@@ -411,7 +393,7 @@ export default function HistoryPage() {
                 <VelaCard
                   key={dedupKey(candle)}
                   candle={candle}
-                  isNew={novosIds.has((candle as any).id ?? dedupKey(candle))}
+                  isNew={novosIds.has(dedupKey(candle))}
                 />
               ))}
             </div>
@@ -440,7 +422,7 @@ export default function HistoryPage() {
               </thead>
               <tbody>
                 {visivelSlice.map((candle) => {
-                  const ts = candle.created_at || (candle as any).timestamp
+                  const ts = (candle.created_at || (candle as any).timestamp) as string
                   const multColor: Record<Candle['cor'], string> = {
                     blue: 'text-blue-400', purple: 'text-purple-400', pink: 'text-pink-400',
                   }

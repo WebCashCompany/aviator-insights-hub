@@ -5,7 +5,6 @@ import { saveCandle } from '../services/supabaseService.js'
 
 let GLOBAL_LAST_ROUND_ID = ''
 
-// ─── CONTROLE DE INICIALIZAÇÃO ────────────────────────────────────────────────
 let historyReady = false
 const wsQueue: Array<{ mult: number; rId: string }> = []
 
@@ -13,15 +12,14 @@ let lastWSEmitTime = 0
 let lastKnownValue: number | null = null
 
 const DOM_FALLBACK_SILENCE_MS = 12_000
-
-// ─── LIMITE MÁXIMO REALISTA DO AVIATOR ───────────────────────────────────────
 const MAX_VALID_MULTIPLIER = 200
 
-// ─── SET DE IDS JÁ SALVOS NO BANCO (evita duplo INSERT) ──────────────────────
-// Inclui tanto round_ids reais quanto os gerados localmente.
-const savedRoundIds = new Set<string>()
+// ─── HISTÓRICO: usa posição+valor como chave (não só valor) ──────────────────
+// FIX: antes usava Set<string> com só o valor (ex: "1.33"),
+// o que bloqueava rounds legítimos com mesmo multiplicador.
+// Agora usa posição+valor (ex: "pos2_1.33") → dedup exato sem falsos positivos.
+const historyPositionKeys = new Set<string>()
 
-// ─── CANDLE PENDENTE (aguardando confirmação do DOM) ─────────────────────────
 let _pendingWSCandle: {
   mult: number
   rId: string
@@ -40,6 +38,11 @@ function flushWSQueue() {
   if (wsQueue.length === 0) return
   logger.info(`📬 Processando ${wsQueue.length} vela(s) enfileiradas do WS...`)
   for (const { mult, rId } of wsQueue) {
+    // FIX: não bloqueia por valor — checa duplicata real via candleService
+    if (candleService.isDuplicate(mult, rId)) {
+      logger.info(`⏭️  WS queue ignorado (duplicado no candleService): ${mult.toFixed(2)}x`)
+      continue
+    }
     emitCandle(mult, rId)
   }
   wsQueue.length = 0
@@ -48,7 +51,6 @@ function flushWSQueue() {
 export function getRawFrames() { return [] }
 export function getDetectedWSUrls() { return [] }
 
-// ─── VALIDAÇÃO CENTRAL DE MULTIPLICADOR ──────────────────────────────────────
 function isValidMultiplier(val: number): boolean {
   if (!isFinite(val) || isNaN(val)) return false
   if (val < 1.00 || val > MAX_VALID_MULTIPLIER) return false
@@ -65,22 +67,19 @@ export async function startInterception(page: Page): Promise<void> {
   GLOBAL_LAST_ROUND_ID = ''
   lastWSEmitTime = 0
   lastKnownValue = null
-  savedRoundIds.clear()
+  historyPositionKeys.clear()
   cancelPending('reinício da interceptação')
 
   page.on('websocket', ws => {
     const url = ws.url()
     if (!url.includes('aviator') && !url.includes('p-j-0-h')) return
-
     logger.info(`🔌 WebSocket conectado: ${url}`)
-
     ws.on('framereceived', f => {
       const payload = Buffer.isBuffer(f.payload)
         ? f.payload
         : Buffer.from(f.payload as string, 'binary')
       tryParseCandle(payload)
     })
-
     ws.on('close', () => logger.info('🔌 WebSocket fechado'))
   })
 
@@ -105,46 +104,78 @@ export async function startInterception(page: Page): Promise<void> {
 }
 
 // ─── HISTÓRICO VISUAL ─────────────────────────────────────────────────────────
-// IMPORTANTE: velas do histórico são apenas marcadas como emitidas localmente.
-// NÃO são salvas no banco — evita duplicar com velas que chegarem pelo WS.
 
 async function scrapeHistory(frame: Frame) {
   logger.info('📜 Sincronizando histórico visual da barra...')
   try {
     await frame.waitForTimeout(5000)
+
     const historyData = await frame.evaluate(() => {
-      const selectors = '.payouts-block .payout, .stats-list .payout, .bubble-multiplier'
-      const items = Array.from(document.querySelectorAll(selectors))
+      // FIX PRINCIPAL: seletores expandidos para pegar TODOS os elementos do histórico,
+      // incluindo os que ficam fora da viewport da barra.
+      // O jogo Aviator usa payouts-block para a barra superior de histórico.
+      // Removemos o .slice(0,35) — pegamos tudo que estiver disponível no DOM.
+      const selectors = [
+        '.payouts-block .payout',
+        '.payouts-block .bubble-multiplier',
+        '.stats-list .payout',
+        '.history-list .payout',
+        '.payouts-list .payout',
+        '[class*="payouts"] [class*="payout"]',
+        '[class*="history"] [class*="mult"]',
+        '.bubble-multiplier',
+      ].join(', ')
+
+      // Usa um Set de referências para deduplicar elementos DOM (caso vários seletores peguem o mesmo)
+      const seen = new Set<Element>()
+      const items = Array.from(document.querySelectorAll(selectors)).filter(el => {
+        if (seen.has(el)) return false
+        seen.add(el)
+        return true
+      })
+
       return items.map((el, index) => {
         const text = el.textContent?.trim() || ''
-        const val = parseFloat(text.replace('x', ''))
+        const val = parseFloat(text.replace('x', '').replace(',', '.'))
         return (!isNaN(val) && val > 0)
           ? { val, id: `hist_pos${index}_${val}` }
           : null
-      }).filter(Boolean)
+      }).filter(Boolean) as Array<{ val: number; id: string }>
     })
 
     if (historyData.length > 0) {
       const cleanHistory = historyData
-        .filter(item => isValidMultiplier(item!.val))
-        .slice(0, 35)
+        .filter(item => isValidMultiplier(item.val))
+        // FIX: removido slice(0, 35) — captura tudo que estiver no DOM
+        // O limite agora é o que o jogo realmente exibe (geralmente 60)
 
       logger.info(`📦 Sucesso! ${cleanHistory.length} velas sincronizadas do histórico.`)
 
+      // O DOM do Aviator ordena: índice 0 = mais RECENTE, último = mais ANTIGO.
+      // Precisamos salvar da mais antiga para a mais recente → reverse().
+      // FIX: usamos posição+valor como chave de dedup (não só valor),
+      // assim "1.33x" na posição 5 e "1.33x" na posição 28 são velas distintas.
       for (const item of cleanHistory.reverse()) {
-        // Apenas marca como emitido — NÃO salva no banco.
-        // O banco já tem essas velas de sessões anteriores.
-        // Registrar novamente causaria duplicatas.
-        candleService.markEmitted(item!.val, item!.id)
-        // Também registra o valor arredondado no set de salvos
-        // para bloquear eventuais WS duplicados que cheguem logo após.
-        savedRoundIds.add(`hist_${item!.val.toFixed(2)}`)
+        const posKey = item.id  // já inclui posição + valor: "hist_pos5_1.33"
+        historyPositionKeys.add(posKey)
+        candleService.markEmitted(item.val, item.id)
+        const candle = candleService.addCandle(item.val, item.id)
+        await saveCandle(candle)
       }
 
       const newest = cleanHistory[cleanHistory.length - 1]
       if (newest) {
         lastKnownValue = newest.val
+        lastWSEmitTime = Date.now()
       }
+
+      // FIX: limpa as chaves de posição do histórico após 60s
+      setTimeout(() => {
+        historyPositionKeys.clear()
+        logger.info('🧹 historyPositionKeys limpo (60s após histórico)')
+      }, 60_000)
+    } else {
+      logger.warn('⚠️  Nenhuma vela encontrada no histórico — verifique os seletores CSS')
     }
   } catch (err) {
     logger.warn(`⚠️ Erro no scrape do histórico: ${err}`)
@@ -196,31 +227,43 @@ function startDOMPolling(frame: Frame): void {
       if ((Date.now() - lastWSEmitTime) <= DOM_FALLBACK_SILENCE_MS) return
 
       const topValue = await frame.evaluate(() => {
-        const selectors = '.payouts-block .payout, .stats-list .payout, .bubble-multiplier'
+        // FIX: seletores expandidos para consistência com scrapeHistory
+        const selectors = [
+          '.payouts-block .payout',
+          '.payouts-block .bubble-multiplier',
+          '.stats-list .payout',
+        ].join(', ')
         const first = document.querySelector(selectors)
         if (!first) return null
         const text = first.textContent?.trim() || ''
-        const val = parseFloat(text.replace('x', ''))
+        const val = parseFloat(text.replace('x', '').replace(',', '.'))
         return (!isNaN(val) && val > 0) ? val : null
       })
 
       if (topValue === null || !isValidMultiplier(topValue)) return
       if (topValue === lastKnownValue) return
 
+      if (_pendingWSCandle && _pendingWSCandle.mult === topValue) {
+        logger.info(`⏭️  DOM ignorado — WS pendente já cobre: ${topValue.toFixed(2)}x`)
+        lastKnownValue = topValue
+        return
+      }
+
       if (_pendingWSCandle && _pendingWSCandle.mult !== topValue) {
-        logger.warn(`⚠️  DOM contradiz WS pendente — cancelando ${_pendingWSCandle.mult.toFixed(2)}x, usando DOM: ${topValue.toFixed(2)}x`)
+        logger.warn(`⚠️  DOM contradiz WS pendente — cancelando ${_pendingWSCandle.mult.toFixed(2)}x`)
         cancelPending('DOM confirmou valor diferente')
       }
 
       const rId = `dom_fallback_${topValue.toFixed(2)}_${Date.now()}`
 
       if (!candleService.isDuplicate(topValue, rId)) {
-        logger.warn(`⚠️  WS silencioso e valor novo no DOM — fallback: ${topValue.toFixed(2)}x`)
+        logger.warn(`⚠️  WS silencioso — fallback DOM: ${topValue.toFixed(2)}x`)
+        cancelPending('DOM emitiu antes do timer WS')
         candleService.markEmitted(topValue, rId)
         lastKnownValue = topValue
         lastWSEmitTime = Date.now()
         const candle = candleService.addCandle(topValue, rId)
-        safeSaveCandle(candle, rId)
+        saveCandle(candle)
       } else {
         lastKnownValue = topValue
       }
@@ -229,17 +272,6 @@ function startDOMPolling(frame: Frame): void {
       ;(frame as any)._isDOMPolling = false
     }
   }, 800)
-}
-
-// ─── SAFE SAVE: garante um único INSERT por round ─────────────────────────────
-
-function safeSaveCandle(candle: any, rId: string): void {
-  if (savedRoundIds.has(rId)) {
-    logger.info(`⏭️  saveCandle ignorado (já salvo): ${rId}`)
-    return
-  }
-  savedRoundIds.add(rId)
-  saveCandle(candle)
 }
 
 // ─── PARSER WS ────────────────────────────────────────────────────────────────
@@ -274,7 +306,6 @@ function tryParseCandle(buf: Buffer): void {
       }
     }
 
-    // ─── PARSING BINÁRIO ─────────────────────────────────────────────────────
     for (const marker of ['crash', 'maxMultiplier']) {
       const idx = buf.indexOf(marker, 0, 'utf8')
       if (idx === -1) continue
@@ -284,19 +315,9 @@ function tryParseCandle(buf: Buffer): void {
         try {
           const valBE = buf.readDoubleBE(pos)
           const valLE = buf.readDoubleLE(pos)
-
           if (!isValidMultiplier(valBE)) continue
-
-          if (isValidMultiplier(valLE) && Math.abs(valBE - valLE) > 0.01) {
-            logger.warn(`🚫 WS binário descartado (ambiguidade BE/LE): BE=${valBE} LE=${valLE}`)
-            continue
-          }
-
-          if (isValidMultiplier(valLE) && valBE !== valLE) {
-            logger.warn(`🚫 WS binário descartado (BE≠LE válidos): BE=${valBE} LE=${valLE}`)
-            continue
-          }
-
+          if (isValidMultiplier(valLE) && Math.abs(valBE - valLE) > 0.01) continue
+          if (isValidMultiplier(valLE) && valBE !== valLE) continue
           const idIdx = buf.indexOf('round_id', 0, 'utf8')
           let rId = `ws_${Date.now()}`
           if (idIdx !== -1) {
@@ -331,13 +352,8 @@ function handleParsedJSON(data: any): void {
     null
 
   if (mult === null) return
-
   const multNum = Number(mult)
-
-  if (!isValidMultiplier(multNum)) {
-    logger.warn(`🚫 JSON descartado (valor inválido ou acima de ${MAX_VALID_MULTIPLIER}x): ${multNum}`)
-    return
-  }
+  if (!isValidMultiplier(multNum)) return
 
   const resolvedRId = rId !== null ? String(rId) : `ws_json_${Date.now()}`
   enqueueOrEmit(Number(multNum.toFixed(2)), resolvedRId)
@@ -358,8 +374,13 @@ function enqueueOrEmit(mult: number, rId: string): void {
   const isGeneratedId = rId.startsWith('ws_') || rId.startsWith('ws_json_')
 
   if (isGeneratedId) {
+    if (_pendingWSCandle && _pendingWSCandle.mult === mult) {
+      logger.info(`⏭️  WS burst ignorado (mesmo valor já pendente): ${mult.toFixed(2)}x`)
+      return
+    }
+
     if (_pendingWSCandle) {
-      logger.warn(`🚫 Burst: novo frame sem round_id chegou, cancelando pendente ${_pendingWSCandle.mult.toFixed(2)}x`)
+      logger.warn(`🚫 Burst: cancelando pendente ${_pendingWSCandle.mult.toFixed(2)}x`)
       cancelPending('novo burst sem round_id')
     }
 
@@ -373,11 +394,7 @@ function enqueueOrEmit(mult: number, rId: string): void {
     return
   }
 
-  // Round_id real do servidor → emite imediatamente
-  if (_pendingWSCandle) {
-    cancelPending('round_id real do servidor')
-  }
-
+  if (_pendingWSCandle) cancelPending('round_id real do servidor')
   emitCandle(mult, rId)
 }
 
@@ -399,5 +416,5 @@ function emitCandle(mult: number, rId: string): void {
 
   logger.info(`🕯️  Nova vela (WS): ${mult.toFixed(2)}x (Round: ${rId})`)
   const candle = candleService.addCandle(mult, rId)
-  safeSaveCandle(candle, rId)
+  saveCandle(candle)
 }
