@@ -78,6 +78,21 @@ function calcularTendencia(candles: any[]) {
   return { tipo, pctAltas, pctBaixas, altasQtd, baixasQtd, pctAltasRec, total }
 }
 
+// ─── Chave de deduplicação (alinhada com HistoryPage) ────────────────────────
+//
+// BUG CORRIGIDO: antes usava bucket de tempo de 3 s, o que causava duplicatas
+// quando banco e WS chegavam com timestamps ligeiramente diferentes, e também
+// colapsava velas distintas com mesmo multiplicador na mesma janela.
+//
+// Agora usa a mesma estratégia do HistoryPage:
+//   • rid_* → rodada_id presente e não é scrape inicial (hist_*)
+//   • db_*  → fallback pelo id do banco (estável e único)
+function candleKey(c: any): string {
+  const rid = c.rodada_id as string | undefined | null
+  if (rid && !rid.startsWith('hist_')) return `rid_${rid}`
+  return `db_${c.id}`
+}
+
 // ─── Badge de tendência ───────────────────────────────────────────────────────
 function TrendBadge({ t }: { t: ReturnType<typeof calcularTendencia> }) {
   if (!t) return null
@@ -116,7 +131,6 @@ function TrendChart({ chartData }: { chartData: { index: number; mult: number; c
   const data = {
     labels,
     datasets: [
-      // Dataset das velas (pontos + linha fina translúcida)
       {
         label: 'Multiplicador',
         data: displayValues,
@@ -133,7 +147,6 @@ function TrendChart({ chartData }: { chartData: { index: number; mult: number; c
         pointStyle: pointStyles,
         order: 2,
       },
-      // Dataset da Média Móvel (linha âmbar destacada)
       {
         label: `MM${MA_PERIOD}`,
         data: maValues,
@@ -310,15 +323,27 @@ function DashboardContent() {
 
   const { candles: dbCandles, loading } = useCandles({ limit })
 
+  // BUG CORRIGIDO: chave de deduplicação alinhada com HistoryPage.
+  // Antes usava bucket de tempo de 3 s → duplicatas quando banco e WS chegavam
+  // com timestamps ligeiramente diferentes.
+  // Agora usa rodada_id (quando disponível e não é scrape hist_*) ou id do banco.
   const candles = useMemo(() => {
     const wsCandles: any[] = Array.isArray(ws?.candles) ? ws.candles : []
-    const key = (c: any) => {
-      const bucket = Math.floor(new Date(c.created_at).getTime() / 3000)
-      return `${Number(c.multiplicador).toFixed(2)}_${bucket}`
-    }
+
     const map = new Map<string, any>()
-    for (const c of dbCandles) map.set(key(c), c)
-    for (const c of wsCandles) { if (!map.has(key(c))) map.set(key(c), c) }
+
+    // 1. Banco primeiro (fonte de verdade)
+    for (const c of dbCandles) map.set(candleKey(c), c)
+
+    // 2. WS: adiciona apenas o que ainda não está no banco
+    //    hist_* (scrape inicial) são ignoradas para evitar duplicatas
+    for (const c of wsCandles) {
+      const rid = c.rodada_id as string | undefined | null
+      if (rid && rid.startsWith('hist_')) continue
+      const k = candleKey(c)
+      if (!map.has(k)) map.set(k, c)
+    }
+
     return Array.from(map.values())
       .sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())
       .slice(-limit)
