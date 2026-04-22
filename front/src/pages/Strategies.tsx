@@ -72,14 +72,9 @@ interface TradeState {
 }
 
 // ─── Constantes de mercado ────────────────────────────────────────────────────
-//
-// Mercado está pagando quando as últimas MARKET_WINDOW velas têm
-// no máximo MARKET_PAYING_THRESHOLD (48,5%) de velas azuis —
-// ou seja, a maioria é roxa/rosa.
-//
-const MARKET_PAYING_THRESHOLD = 0.485   // 48,5%
-const MARKET_WINDOW           = 60      // últimas 60 velas
-const MARKET_ALERT_COOLDOWN   = 10 * 60 * 1000  // 10 min entre alertas
+const MARKET_PAYING_THRESHOLD = 0.485
+const MARKET_WINDOW           = 60
+const MARKET_ALERT_COOLDOWN   = 10 * 60 * 1000
 
 function bluePercent(candles: Candle[], n = MARKET_WINDOW): number {
   if (!candles.length) return 0
@@ -87,15 +82,10 @@ function bluePercent(candles: Candle[], n = MARKET_WINDOW): number {
   return slice.filter(isBlueCandle).length / slice.length
 }
 
-// Mercado paga quando azuis ≤ 48,5% (maioria sendo roxa/rosa)
 function isMarketPaying(candles: Candle[]): boolean {
   return bluePercent(candles, MARKET_WINDOW) <= MARKET_PAYING_THRESHOLD
 }
 
-/**
- * Conta quantas velas AZUIS consecutivas existem no FINAL do array.
- * Qualquer vela não-azul interrompe a sequência.
- */
 function currentBlueStreak(candles: Candle[]): number {
   let streak = 0
   for (let i = candles.length - 1; i >= 0; i--) {
@@ -105,7 +95,7 @@ function currentBlueStreak(candles: Candle[]): number {
   return streak
 }
 
-// ─── Chave de deduplicação confiável ─────────────────────────────────────────
+// ─── Chave de deduplicação ────────────────────────────────────────────────────
 function candleKey(c: any): string {
   if (c.id != null && c.id !== '') return `id_${c.id}`
   const ts = c.created_at || c.timestamp
@@ -117,7 +107,6 @@ function candleKey(c: any): string {
 }
 
 // ─── Backtesting ──────────────────────────────────────────────────────────────
-// Só contabiliza entradas quando o mercado estava pagando no momento do sinal.
 function computeStats(strategy: StrategyDef, candles: Candle[]): StratStats {
   let g1 = 0, g2 = 0, loss = 0
 
@@ -125,30 +114,22 @@ function computeStats(strategy: StrategyDef, candles: Candle[]): StratStats {
     let idx = 3
     while (idx < candles.length - 2) {
       const c = candles[idx]
-
-      // Só contabiliza se mercado estava pagando naquele ponto
       const sliceAtIdx = candles.slice(0, idx + 1)
       if (!isMarketPaying(sliceAtIdx)) { idx++; continue }
-
       if (isPurpleCandle(c)) {
         const prev1 = candles[idx - 1]
         const prev2 = candles[idx - 2]
         const prev3 = candles[idx - 3]
-
-        // Padrão: exatamente 2 azuis antes da roxa → ENTRADA
         const exactlyTwoBlues =
-          isBlueCandle(prev1) &&
-          isBlueCandle(prev2) &&
+          isBlueCandle(prev1) && isBlueCandle(prev2) &&
           prev3 !== undefined && !isBlueCandle(prev3)
-
         if (exactlyTwoBlues) {
           const entryIdx = idx + 1
           const galeIdx  = idx + 2
           if (entryIdx >= candles.length) { idx++; continue }
           const m1 = Number(candles[entryIdx].multiplicador)
           if (m1 >= 2) {
-            g1++
-            idx = entryIdx + 1
+            g1++; idx = entryIdx + 1
           } else if (galeIdx < candles.length) {
             const m2 = Number(candles[galeIdx].multiplicador)
             if (m2 >= 2) { g2++; idx = galeIdx + 1 }
@@ -159,20 +140,14 @@ function computeStats(strategy: StrategyDef, candles: Candle[]): StratStats {
       }
       idx++
     }
-    const wins    = g1 + g2
-    const total   = wins + loss
-    const winRate = total > 0 ? (wins / total) * 100 : 0
-    return { wins, losses: loss, g1, g2, loss, winRate, total }
+    const wins = g1 + g2; const total = wins + loss
+    return { wins, losses: loss, g1, g2, loss, winRate: total > 0 ? (wins / total) * 100 : 0, total }
   }
 
-  // Estratégias genéricas
   let i = 5
   while (i < candles.length - 2) {
     const slice = candles.slice(0, i + 1)
-
-    // Só contabiliza se mercado estava pagando
     if (!isMarketPaying(slice)) { i++; continue }
-
     const signal = strategy.detectSignal(slice)
     if (signal?.tipo !== 'entrar') { i++; continue }
     const next1 = Number(candles[i + 1].multiplicador)
@@ -181,10 +156,8 @@ function computeStats(strategy: StrategyDef, candles: Candle[]): StratStats {
     else if (next2 >= 2) { g2++; i += 3 }
     else { loss++; i += 3 }
   }
-  const wins    = g1 + g2
-  const total   = wins + loss
-  const winRate = total > 0 ? (wins / total) * 100 : 0
-  return { wins, losses: loss, g1, g2, loss, winRate, total }
+  const wins = g1 + g2; const total = wins + loss
+  return { wins, losses: loss, g1, g2, loss, winRate: total > 0 ? (wins / total) * 100 : 0, total }
 }
 
 // ─── Estratégias ──────────────────────────────────────────────────────────────
@@ -224,34 +197,22 @@ function buildStrategies(config: Record<string, string>): StrategyDef[] {
       icon: <Zap className="h-4 w-4" />,
       detectSignal(candles) {
         if (candles.length < 4) return null
-
-        const bluePct   = bluePercent(candles, MARKET_WINDOW)
-        const mercadoOk = bluePct <= MARKET_PAYING_THRESHOLD
-        if (!mercadoOk) return {
+        const bluePct = bluePercent(candles, MARKET_WINDOW)
+        if (bluePct > MARKET_PAYING_THRESHOLD) return {
           tipo: 'bloqueado',
           msg: `Mercado não pagando (${(bluePct * 100).toFixed(1)}% azuis nas últ. ${MARKET_WINDOW}) — sinal bloqueado`,
           color: C.amber,
         }
-
         const last    = candles[candles.length - 1]
         const lastCor = candleCor(last)
-
-        // ── Última vela é ROXA ────────────────────────────────────────────────
         if (lastCor === 'purple') {
           const prev1 = candles[candles.length - 2]
           const prev2 = candles[candles.length - 3]
           const prev3 = candles[candles.length - 4]
-
-          // Exatamente 2 azuis antes da roxa (a 3ª posição atrás NÃO pode ser azul)
           const exactlyTwoBlues =
-            prev1 && isBlueCandle(prev1) &&
-            prev2 && isBlueCandle(prev2) &&
-            prev3 && !isBlueCandle(prev3)
-
+            prev1 && isBlueCandle(prev1) && prev2 && isBlueCandle(prev2) && prev3 && !isBlueCandle(prev3)
           if (exactlyTwoBlues)
             return { tipo: 'entrar', msg: `🚀 ENTRADA CONFIRMADA — roxa após exatamente 2 azuis! Entre na PRÓXIMA vela!`, color: C.green }
-
-          // Conta streak apenas para mensagem informativa
           let streak = 0
           for (let i = candles.length - 2; i >= 0; i--) {
             if (isBlueCandle(candles[i])) streak++
@@ -259,38 +220,22 @@ function buildStrategies(config: Record<string, string>): StrategyDef[] {
           }
           return {
             tipo: 'bloqueado',
-            msg: streak === 0
-              ? `Roxa veio, mas não havia azuis antes — precisa exatamente 2`
-              : streak === 1
-              ? `Roxa veio após apenas 1 azul — precisa exatamente 2`
-              : `Roxa veio após ${streak} azuis — precisa exatamente 2`,
+            msg: streak === 0 ? `Roxa veio, mas não havia azuis antes — precisa exatamente 2`
+               : streak === 1 ? `Roxa veio após apenas 1 azul — precisa exatamente 2`
+               : `Roxa veio após ${streak} azuis — precisa exatamente 2`,
             color: C.amber,
           }
         }
-
-        // ── Última vela é AZUL ────────────────────────────────────────────────
         if (lastCor === 'blue') {
           let bluesNow = 0
           for (let i = candles.length - 1; i >= 0; i--) {
             if (isBlueCandle(candles[i])) bluesNow++
             else break
           }
-
-          if (bluesNow >= 3) return {
-            tipo: 'bloqueado',
-            msg: `${bluesNow} azuis seguidas — passou do limite (precisa exatamente 2), ignorar próxima roxa`,
-            color: C.amber,
-          }
-          if (bluesNow === 2) return {
-            tipo: 'pre_sinal',
-            msg: `⚠️ PRÉ-SINAL — 2 azuis seguidas! Aguardando roxa para confirmar entrada`,
-            color: C.amber,
-          }
-          // bluesNow === 1
+          if (bluesNow >= 3) return { tipo: 'bloqueado', msg: `${bluesNow} azuis seguidas — passou do limite, ignorar próxima roxa`, color: C.amber }
+          if (bluesNow === 2) return { tipo: 'pre_sinal', msg: `⚠️ PRÉ-SINAL — 2 azuis seguidas! Aguardando roxa para confirmar entrada`, color: C.amber }
           return { tipo: 'aguardar', msg: `1 azul — aguardando mais 1 azul para pré-sinal...`, color: C.muted }
         }
-
-        // ── Rosa ou desconhecida: reseta ──────────────────────────────────────
         return { tipo: 'aguardar', msg: 'Padrão resetado — aguardando sequência de 2 azuis...', color: C.muted }
       },
     },
@@ -312,17 +257,17 @@ function StatsRow({ stats }: { stats: StratStats }) {
       </div>
       <div className="flex items-center gap-2">
         <div className="flex items-center gap-1.5 px-2 py-1 rounded-lg" style={{ background: C.green + '14' }}>
-          <span className="text-[10px] font-bold"     style={{ color: C.green }}>Win</span>
+          <span className="text-[10px] font-bold" style={{ color: C.green }}>Win</span>
           <span className="text-[11px] font-semibold" style={{ color: C.green }}>{stats.g1}</span>
           <span className="text-[10px] text-white/25">{pG1.toFixed(0)}%</span>
         </div>
         <div className="flex items-center gap-1.5 px-2 py-1 rounded-lg" style={{ background: C.amber + '14' }}>
-          <span className="text-[10px] font-bold"     style={{ color: C.amber }}>Gale</span>
+          <span className="text-[10px] font-bold" style={{ color: C.amber }}>Gale</span>
           <span className="text-[11px] font-semibold" style={{ color: C.amber }}>{stats.g2}</span>
           <span className="text-[10px] text-white/25">{pG2.toFixed(0)}%</span>
         </div>
         <div className="flex items-center gap-1.5 px-2 py-1 rounded-lg" style={{ background: C.red + '14' }}>
-          <span className="text-[10px] font-bold"     style={{ color: C.red }}>Loss</span>
+          <span className="text-[10px] font-bold" style={{ color: C.red }}>Loss</span>
           <span className="text-[11px] font-semibold" style={{ color: C.red }}>{stats.loss}</span>
           <span className="text-[10px] text-white/25">{pLoss.toFixed(0)}%</span>
         </div>
@@ -342,14 +287,9 @@ function MarketPayingBanner({ candles }: { candles: Candle[] }) {
   const paying = pct <= MARKET_PAYING_THRESHOLD
   return (
     <div className="rounded-2xl border p-3 flex items-center gap-3"
-      style={{
-        borderColor: paying ? C.green + '40' : C.amber + '30',
-        background:  paying ? C.green + '0a' : 'rgba(255,255,255,0.02)',
-      }}
-    >
+      style={{ borderColor: paying ? C.green + '40' : C.amber + '30', background: paying ? C.green + '0a' : 'rgba(255,255,255,0.02)' }}>
       <div className="h-2 w-2 rounded-full shrink-0"
-        style={{ background: paying ? C.green : C.amber, boxShadow: paying ? `0 0 8px ${C.green}` : 'none' }}
-      />
+        style={{ background: paying ? C.green : C.amber, boxShadow: paying ? `0 0 8px ${C.green}` : 'none' }} />
       <p className="text-xs font-medium" style={{ color: paying ? C.green : 'rgba(255,255,255,0.4)' }}>
         {paying
           ? `✅ Mercado pagando — ${(pct * 100).toFixed(1)}% azuis nas últimas ${MARKET_WINDOW} velas`
@@ -369,11 +309,8 @@ function WppBar({ wppConfig, onUpdate, selectedStrategyName }: {
   const [showModal, setShowModal] = useState(false)
   const hasTargets = wppConfig.targets.length > 0
   const serverOk   = wppConfig.serverConfigured
-
   const statusLabel = wppConfig.enabled
-    ? selectedStrategyName
-      ? `Ativo · ${selectedStrategyName} · alerta de mercado ON`
-      : 'Ativo · alerta de mercado pagando ON'
+    ? selectedStrategyName ? `Ativo · ${selectedStrategyName} · alerta de mercado ON` : 'Ativo · alerta de mercado pagando ON'
     : hasTargets
       ? `${wppConfig.targets.length} destino${wppConfig.targets.length > 1 ? 's' : ''} configurado${wppConfig.targets.length > 1 ? 's' : ''}`
       : 'Nenhum destino configurado'
@@ -381,11 +318,7 @@ function WppBar({ wppConfig, onUpdate, selectedStrategyName }: {
   return (
     <>
       <div className="rounded-2xl border p-3.5 flex items-center gap-3 transition-all"
-        style={{
-          borderColor: wppConfig.enabled ? C.green + '45' : 'rgba(255,255,255,0.08)',
-          background:  wppConfig.enabled ? C.green + '08' : 'rgba(255,255,255,0.015)',
-        }}
-      >
+        style={{ borderColor: wppConfig.enabled ? C.green + '45' : 'rgba(255,255,255,0.08)', background: wppConfig.enabled ? C.green + '08' : 'rgba(255,255,255,0.015)' }}>
         <div className="h-9 w-9 rounded-2xl flex items-center justify-center shrink-0"
           style={{ background: wppConfig.enabled ? C.green + '20' : 'rgba(255,255,255,0.06)' }}>
           <MessageCircle className="h-4 w-4" style={{ color: wppConfig.enabled ? C.green : 'rgba(255,255,255,0.3)' }} />
@@ -394,8 +327,7 @@ function WppBar({ wppConfig, onUpdate, selectedStrategyName }: {
           <p className="text-sm font-semibold text-white/80 leading-tight">
             Robô WhatsApp
             {!serverOk && (
-              <span className="ml-2 text-[10px] font-normal px-1.5 py-0.5 rounded-full"
-                style={{ background: C.red + '20', color: C.red }}>
+              <span className="ml-2 text-[10px] font-normal px-1.5 py-0.5 rounded-full" style={{ background: C.red + '20', color: C.red }}>
                 WPP desconectado
               </span>
             )}
@@ -406,23 +338,17 @@ function WppBar({ wppConfig, onUpdate, selectedStrategyName }: {
           className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-[11px] border border-white/10 text-white/40 hover:bg-white/5 hover:text-white/70 transition-colors shrink-0">
           <Users className="h-3.5 w-3.5" />{hasTargets ? 'Editar' : 'Configurar'}
         </button>
-        <button
-          onClick={() => onUpdate({ enabled: !wppConfig.enabled })}
-          disabled={!hasTargets || !serverOk}
+        <button onClick={() => onUpdate({ enabled: !wppConfig.enabled })} disabled={!hasTargets || !serverOk}
           className="relative h-5 w-9 rounded-full transition-all duration-200 shrink-0 disabled:opacity-30 disabled:cursor-not-allowed"
           style={{ background: wppConfig.enabled ? C.green : 'rgba(255,255,255,0.12)' }}
-          title={!serverOk ? 'WhatsApp não conectado no servidor' : !hasTargets ? 'Configure um destino primeiro' : ''}
-        >
+          title={!serverOk ? 'WhatsApp não conectado no servidor' : !hasTargets ? 'Configure um destino primeiro' : ''}>
           <span className="absolute top-0.5 left-0.5 h-4 w-4 rounded-full bg-white transition-all duration-200 shadow"
             style={{ transform: wppConfig.enabled ? 'translateX(16px)' : 'translateX(0)' }} />
         </button>
       </div>
       {showModal && (
-        <WppModal
-          onClose={() => setShowModal(false)}
-          initialTargets={wppConfig.targets}
-          onTargetsChange={targets => { onUpdate({ targets }); setShowModal(false) }}
-        />
+        <WppModal onClose={() => setShowModal(false)} initialTargets={wppConfig.targets}
+          onTargetsChange={targets => { onUpdate({ targets }); setShowModal(false) }} />
       )}
     </>
   )
@@ -432,14 +358,7 @@ function WppBar({ wppConfig, onUpdate, selectedStrategyName }: {
 const LIMIT_OPTIONS = [50, 100, 200, 1000] as const
 type LimitOption = typeof LIMIT_OPTIONS[number]
 const DEFAULT_WPP: WppConfig = { enabled: false, serverConfigured: false, lastSentAt: null, targets: [] }
-
-const INITIAL_TRADE: TradeState = {
-  phase: 'idle',
-  entryCandles: 0,
-  stratName: '',
-  preSignalStreak: 0,
-  entryCandleIndex: -1,
-}
+const INITIAL_TRADE: TradeState = { phase: 'idle', entryCandles: 0, stratName: '', preSignalStreak: 0, entryCandleIndex: -1 }
 
 // ─── Página Principal ─────────────────────────────────────────────────────────
 export default function StrategiesPage() {
@@ -451,10 +370,7 @@ export default function StrategiesPage() {
     const wsArr = Array.isArray(wsCandles) ? wsCandles : []
     const map = new Map<string, Candle>()
     for (const c of dbCandles) map.set(candleKey(c), c as Candle)
-    for (const c of wsArr) {
-      const k = candleKey(c)
-      if (!map.has(k)) map.set(k, c)
-    }
+    for (const c of wsArr) { const k = candleKey(c); if (!map.has(k)) map.set(k, c) }
     return Array.from(map.values())
       .sort((a, b) =>
         new Date((a.created_at || a.timestamp) as string).getTime() -
@@ -481,9 +397,7 @@ export default function StrategiesPage() {
   const setSelectedId = useCallback((id: string | null) => {
     setSelectedIdRaw(id)
     apiFetch(`${API_BASE}/bot/config`, {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ selectedStratId: id }),
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ selectedStratId: id }),
     }).catch(() => {})
   }, [])
 
@@ -492,9 +406,7 @@ export default function StrategiesPage() {
       const next = { ...prev, ...partial }
       if (partial.enabled !== undefined) {
         apiFetch(`${API_BASE}/bot/config`, {
-          method:  'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body:    JSON.stringify({ enabled: next.enabled }),
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: next.enabled }),
         }).catch(() => {})
       }
       return next
@@ -503,31 +415,40 @@ export default function StrategiesPage() {
 
   const [stratConfig, setStratConfig] = useState<Record<string, string>>({})
 
+  // ── Refs dos monitores ────────────────────────────────────────────────────
   const tradeRef       = useRef<TradeState>({ ...INITIAL_TRADE })
-  const prevBlueStreak = useRef<number>(-1)
-  const prevTipoRef    = useRef<string | null>(null)
-  const lastTotalCount = useRef<number>(-1)
   const lastPayAlertAt = useRef<number>(0)
+  const lastTotalCount = useRef<number>(-1)
+
+  // FIX A — monitor de mercado:
+  // null = primeira execução (ignora, não envia alerta).
+  // false → true = transição genuína, dispara alerta.
+  // Impede falso positivo no mount quando mercado já está pagando.
+  const wasPayingRef = useRef<boolean | null>(null)
+
+  // FIX B — s_roxa_azul50:
+  // -1 = primeira execução: apenas registra baseline, nunca dispara sinal.
+  // Impede falso pré-sinal disparado por streak já existente no mount.
+  const lastStratCandleCount = useRef<number>(-1)
+  const prevBlueStreak       = useRef<number>(-1)
+
+  // FIX C — estratégias genéricas: mesmo padrão.
+  const lastGenCandleCount = useRef<number>(-1)
+  const prevTipoRef        = useRef<string | null>(null)
 
   type TradeDisplay =
-    | { kind: 'idle' }
-    | { kind: 'pre_sinal' }
-    | { kind: 'warning' }
-    | { kind: 'confirmed' }
-    | { kind: 'gale' }
+    | { kind: 'idle' } | { kind: 'pre_sinal' } | { kind: 'warning' }
+    | { kind: 'confirmed' } | { kind: 'gale' }
     | { kind: 'result'; result: 'win_g1' | 'win_g2' | 'loss'; multiplier: number }
 
   const [tradeDisplay, setTradeDisplay] = useState<TradeDisplay>({ kind: 'idle' })
 
-  // ── Checagem periódica do status do WPP ──────────────────────────────────
+  // ── Status do WPP ─────────────────────────────────────────────────────────
   useEffect(() => {
     const checkStatus = () => {
       apiFetch(`${API_BASE}/whatsapp/status`)
         .then(r => r.json())
-        .then(d => updateWppConfig({
-          serverConfigured: !!d.configured,
-          ...(d.targets?.length ? { targets: d.targets } : {}),
-        }))
+        .then(d => updateWppConfig({ serverConfigured: !!d.configured, ...(d.targets?.length ? { targets: d.targets } : {}) }))
         .catch(() => updateWppConfig({ serverConfigured: false }))
     }
     checkStatus()
@@ -535,22 +456,18 @@ export default function StrategiesPage() {
     return () => clearInterval(id)
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
-  const strategies = useMemo(() => buildStrategies(stratConfig).filter(s => !!s.name), [stratConfig])
-  const selected   = strategies.find(s => s.id === selectedId) ?? null
-
-  const allStats = useMemo<Record<string, StratStats>>(() => {
+  const strategies  = useMemo(() => buildStrategies(stratConfig).filter(s => !!s.name), [stratConfig])
+  const selected    = strategies.find(s => s.id === selectedId) ?? null
+  const allStats    = useMemo<Record<string, StratStats>>(() => {
     if (candles.length < 10) return {}
     return Object.fromEntries(strategies.map(s => [s.id, computeStats(s, candles)]))
   }, [strategies, candles])
-
-  const allSignals = useMemo<Record<string, SignalResult | null>>(() => {
+  const allSignals  = useMemo<Record<string, SignalResult | null>>(() => {
     if (!candles.length) return {}
     return Object.fromEntries(strategies.map(s => [s.id, s.detectSignal(candles)]))
   }, [strategies, candles])
-
   const sinalAtual: SignalResult | null = allSignals[selectedId ?? ''] ?? null
   const marketPaying = useMemo(() => isMarketPaying(candles), [candles])
-
   const bestId = useMemo(() => {
     const valid = Object.entries(allStats).filter(([, st]) => st.total >= 10)
     if (!valid.length) return null
@@ -562,74 +479,44 @@ export default function StrategiesPage() {
     if (!wppConfig.enabled)          { console.warn('[WPP] bloqueado: robô desabilitado'); return }
     if (!wppConfig.serverConfigured) { console.warn('[WPP] bloqueado: WPP não conectado'); return }
     if (!wppConfig.targets.length)   { console.warn('[WPP] bloqueado: nenhum destino'); return }
-    const payload = {
-      ...body,
-      targets: wppConfig.targets,
-      ...(withLink ? { gameLink: GAME_LINK } : {}),
-    }
+    const payload = { ...body, targets: wppConfig.targets, ...(withLink ? { gameLink: GAME_LINK } : {}) }
     console.info(`[WPP] Enviando ${endpoint}`, payload)
     try {
       const res = await apiFetch(`${API_BASE}${endpoint}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
       })
-      if (!res.ok) {
-        const err = await res.text().catch(() => res.statusText)
-        console.error(`[WPP] Erro HTTP ${res.status} em ${endpoint}:`, err)
-        return
-      }
+      if (!res.ok) { console.error(`[WPP] Erro HTTP ${res.status}:`, await res.text().catch(() => res.statusText)); return }
       updateWppConfig({ lastSentAt: Date.now() })
       console.info(`[WPP] ✅ ${endpoint} enviado`)
-    } catch (e) {
-      console.error(`[WPP] Falha de rede em ${endpoint}:`, e)
-    }
+    } catch (e) { console.error(`[WPP] Falha de rede em ${endpoint}:`, e) }
   }, [wppConfig.enabled, wppConfig.serverConfigured, wppConfig.targets, updateWppConfig])
 
-  // ── Alerta de mercado pagando ──────────────────────────────────────────────
   const apiPostMarket = useCallback(async () => {
     if (!wppConfig.enabled || !wppConfig.serverConfigured || !wppConfig.targets.length) return
     try {
       await apiFetch(`${API_BASE}/whatsapp/market-paying`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ targets: wppConfig.targets, gameLink: GAME_LINK }),
       })
       updateWppConfig({ lastSentAt: Date.now() })
-    } catch (e) {
-      console.error('[WPP] Falha ao enviar market-paying:', e)
-    }
+    } catch (e) { console.error('[WPP] Falha ao enviar market-paying:', e) }
   }, [wppConfig.enabled, wppConfig.serverConfigured, wppConfig.targets, updateWppConfig])
 
   // ─── Monitor de mercado pagando ───────────────────────────────────────────
-  //
-  // FIX: wasPayingRef inicializado com `null` para diferenciar
-  // "primeira execução" (sem histórico real) de uma transição genuína
-  // não pagando → pagando. Sem isso, o alerta disparava sempre que o
-  // componente montava com o mercado já pagando.
-  //
-  const wasPayingRef = useRef<boolean | null>(null)
-
+  // FIX A: null na 1ª execução → sem alerta. Só dispara em transição false→true.
   useEffect(() => {
     if (!wppConfig.enabled) return
     if (candles.length < MARKET_WINDOW) return
-
     const totalNow = candles.length
     if (totalNow === lastTotalCount.current) return
     lastTotalCount.current = totalNow
-
     const paying = isMarketPaying(candles)
-
-    // Só envia alerta na transição genuína: não pagando → pagando.
-    // wasPayingRef === null significa primeira execução — ignora para
-    // evitar falso positivo no mount.
     if (paying && wasPayingRef.current === false) {
       if (Date.now() - lastPayAlertAt.current >= MARKET_ALERT_COOLDOWN) {
         lastPayAlertAt.current = Date.now()
         apiPostMarket()
       }
     }
-
     wasPayingRef.current = paying
   }, [candles, wppConfig.enabled, apiPostMarket])
 
@@ -647,7 +534,6 @@ export default function StrategiesPage() {
       if (!resultCandle) return false
       const mult  = Number(resultCandle.multiplicador)
       const isWin = mult >= 2
-
       if (phase === 'confirmed') {
         if (isWin) {
           apiPost('/whatsapp/result', { strategyName: stratName, result: 'win_g1', multiplier: mult }, false)
@@ -671,60 +557,58 @@ export default function StrategiesPage() {
 
     if (selected.id === 's_roxa_azul50') {
       const streak = currentBlueStreak(candles)
-      const prev   = prevBlueStreak.current
       const paying = isMarketPaying(candles)
+
+      // FIX B: primeira execução = apenas registra baseline, não dispara sinal.
+      if (lastStratCandleCount.current === -1) {
+        lastStratCandleCount.current = candles.length
+        prevBlueStreak.current       = streak
+        return
+      }
+      // Re-render sem nova vela: ignora.
+      if (candles.length <= lastStratCandleCount.current) return
+      lastStratCandleCount.current = candles.length
+
+      const prev = prevBlueStreak.current
 
       if (trade.phase === 'idle') {
         if (!paying) { prevBlueStreak.current = streak; return }
-        // Chegou exatamente em 2 azuis → envia pré-sinal
         if (streak === 2 && prev !== 2) {
           apiPost('/whatsapp/warning', { strategyName: selected.name }, true)
-          tradeRef.current = {
-            phase: 'pre_sinal',
-            entryCandles: wsCandles.length,
-            stratName: selected.name,
-            preSignalStreak: streak,
-            entryCandleIndex: -1,
-          }
+          tradeRef.current = { phase: 'pre_sinal', entryCandles: wsCandles.length, stratName: selected.name, preSignalStreak: streak, entryCandleIndex: -1 }
           setTradeDisplay({ kind: 'pre_sinal' })
         }
       } else if (trade.phase === 'pre_sinal') {
         if (tipo === 'entrar') {
-          // Roxa confirmada após exatamente 2 azuis → entrada
           apiPost('/whatsapp/confirmed', { strategyName: selected.name }, true)
-          tradeRef.current = {
-            ...trade,
-            phase: 'confirmed',
-            entryCandles: wsCandles.length,
-            entryCandleIndex: candles.length,
-          }
+          tradeRef.current = { ...trade, phase: 'confirmed', entryCandles: wsCandles.length, entryCandleIndex: candles.length }
           setTradeDisplay({ kind: 'confirmed' })
         } else if (!paying || streak === 0 || streak >= 3) {
-          // Reseta: mercado parou de pagar, padrão quebrado ou passou de 2 azuis
           tradeRef.current = { ...INITIAL_TRADE }
           setTradeDisplay({ kind: 'idle' })
         }
       } else if (trade.phase === 'confirmed') {
-        if (candles.length > trade.entryCandleIndex) {
-          resolveResult(trade.entryCandleIndex, 'confirmed', trade.stratName)
-        }
+        if (candles.length > trade.entryCandleIndex) resolveResult(trade.entryCandleIndex, 'confirmed', trade.stratName)
       } else if (trade.phase === 'gale') {
-        if (candles.length > trade.entryCandleIndex) {
-          resolveResult(trade.entryCandleIndex, 'gale', trade.stratName)
-        }
+        if (candles.length > trade.entryCandleIndex) resolveResult(trade.entryCandleIndex, 'gale', trade.stratName)
       }
 
       prevBlueStreak.current = streak
 
     } else {
-      // Estratégias genéricas
       const paying = isMarketPaying(candles)
 
+      // FIX C: mesma proteção de primeira execução.
+      if (lastGenCandleCount.current === -1) {
+        lastGenCandleCount.current = candles.length
+        prevTipoRef.current        = tipo
+        return
+      }
+      if (candles.length <= lastGenCandleCount.current) return
+      lastGenCandleCount.current = candles.length
+
       if (!paying) {
-        if (trade.phase !== 'idle') {
-          tradeRef.current = { ...INITIAL_TRADE }
-          setTradeDisplay({ kind: 'idle' })
-        }
+        if (trade.phase !== 'idle') { tradeRef.current = { ...INITIAL_TRADE }; setTradeDisplay({ kind: 'idle' }) }
         prevTipoRef.current = tipo
         return
       }
@@ -732,48 +616,34 @@ export default function StrategiesPage() {
       if (trade.phase === 'idle') {
         if (prevTipoRef.current !== 'entrar' && tipo === 'entrar') {
           apiPost('/whatsapp/warning', { strategyName: selected.name }, true)
-          tradeRef.current = {
-            phase: 'warning_sent',
-            entryCandles: wsCandles.length,
-            stratName: selected.name,
-            preSignalStreak: 0,
-            entryCandleIndex: -1,
-          }
+          tradeRef.current = { phase: 'warning_sent', entryCandles: wsCandles.length, stratName: selected.name, preSignalStreak: 0, entryCandleIndex: -1 }
           setTradeDisplay({ kind: 'warning' })
         }
       } else if (trade.phase === 'warning_sent') {
         if (wsCandles.length > trade.entryCandles) {
           apiPost('/whatsapp/confirmed', { strategyName: selected.name }, true)
-          tradeRef.current = {
-            ...trade,
-            phase: 'confirmed',
-            entryCandles: wsCandles.length,
-            entryCandleIndex: candles.length,
-          }
+          tradeRef.current = { ...trade, phase: 'confirmed', entryCandles: wsCandles.length, entryCandleIndex: candles.length }
           setTradeDisplay({ kind: 'confirmed' })
         }
       } else if (trade.phase === 'confirmed') {
-        if (candles.length > trade.entryCandleIndex) {
-          resolveResult(trade.entryCandleIndex, 'confirmed', trade.stratName)
-        }
+        if (candles.length > trade.entryCandleIndex) resolveResult(trade.entryCandleIndex, 'confirmed', trade.stratName)
       } else if (trade.phase === 'gale') {
-        if (candles.length > trade.entryCandleIndex) {
-          resolveResult(trade.entryCandleIndex, 'gale', trade.stratName)
-        }
+        if (candles.length > trade.entryCandleIndex) resolveResult(trade.entryCandleIndex, 'gale', trade.stratName)
       }
 
       prevTipoRef.current = tipo
     }
   }, [candles, wsCandles, sinalAtual, wppConfig.enabled, selected, apiPost])
 
-  // ── Reset ao trocar de estratégia ─────────────────────────────────────────
+  // ── Reset ao trocar estratégia ────────────────────────────────────────────
   useEffect(() => {
-    tradeRef.current       = { ...INITIAL_TRADE }
-    prevBlueStreak.current = -1
-    prevTipoRef.current    = null
-    lastTotalCount.current = -1
-    // Reseta para null para que a nova estratégia não dispare alerta falso
-    wasPayingRef.current   = null
+    tradeRef.current             = { ...INITIAL_TRADE }
+    prevBlueStreak.current       = -1
+    prevTipoRef.current          = null
+    lastTotalCount.current       = -1
+    lastStratCandleCount.current = -1  // força nova "primeira execução"
+    lastGenCandleCount.current   = -1  // idem
+    wasPayingRef.current         = null // idem monitor mercado
     setTradeDisplay({ kind: 'idle' })
   }, [selectedId])
 
@@ -788,24 +658,19 @@ export default function StrategiesPage() {
 
   return (
     <div className="space-y-5 pb-20 lg:pb-0">
-
       <div className="flex items-center justify-between gap-3 flex-wrap">
         <h2 className="text-xl font-bold text-foreground">Estratégias</h2>
         <div className="flex rounded-lg overflow-hidden border border-white/10">
           {LIMIT_OPTIONS.map(l => (
-            <button key={l} onClick={() => setLimit(l)}
-              className="px-2.5 py-1 text-[11px] font-medium transition-colors"
-              style={{
-                background: limit === l ? 'rgba(127,119,221,0.3)' : 'transparent',
-                color:      limit === l ? 'rgba(255,255,255,0.9)' : 'rgba(255,255,255,0.4)',
-              }}
-            >{l}</button>
+            <button key={l} onClick={() => setLimit(l)} className="px-2.5 py-1 text-[11px] font-medium transition-colors"
+              style={{ background: limit === l ? 'rgba(127,119,221,0.3)' : 'transparent', color: limit === l ? 'rgba(255,255,255,0.9)' : 'rgba(255,255,255,0.4)' }}>
+              {l}
+            </button>
           ))}
         </div>
       </div>
 
       {candles.length >= MARKET_WINDOW && <MarketPayingBanner candles={candles} />}
-
       <WppBar wppConfig={wppConfig} onUpdate={updateWppConfig} selectedStrategyName={selected?.name ?? null} />
 
       {wppConfig.enabled && selected && !marketPaying && (
@@ -819,7 +684,6 @@ export default function StrategiesPage() {
       )}
 
       {selected ? (() => {
-
         if (tradeDisplay.kind === 'pre_sinal') return (
           <div className="rounded-2xl border p-3.5" style={{ borderColor: C.amber + '50', background: C.amber + '0e' }}>
             <div className="flex items-center gap-3">
@@ -831,7 +695,6 @@ export default function StrategiesPage() {
             </div>
           </div>
         )
-
         if (tradeDisplay.kind === 'warning') return (
           <div className="rounded-2xl border p-3.5" style={{ borderColor: C.amber + '50', background: C.amber + '0e' }}>
             <div className="flex items-center gap-3">
@@ -843,7 +706,6 @@ export default function StrategiesPage() {
             </div>
           </div>
         )
-
         if (tradeDisplay.kind === 'confirmed') return (
           <div className="rounded-2xl border p-3.5" style={{ borderColor: C.green + '50', background: C.green + '0e' }}>
             <div className="flex items-center gap-3">
@@ -855,7 +717,6 @@ export default function StrategiesPage() {
             </div>
           </div>
         )
-
         if (tradeDisplay.kind === 'gale') return (
           <div className="rounded-2xl border p-3.5" style={{ borderColor: C.red + '50', background: C.red + '0e' }}>
             <div className="flex items-center gap-3">
@@ -867,10 +728,8 @@ export default function StrategiesPage() {
             </div>
           </div>
         )
-
         if (tradeDisplay.kind === 'result') {
-          const r     = tradeDisplay.result
-          const isWin = r !== 'loss'
+          const r = tradeDisplay.result; const isWin = r !== 'loss'
           const label = r === 'win_g1' ? `✅ WIN direto — ${tradeDisplay.multiplier.toFixed(2)}x`
                       : r === 'win_g2' ? `✅ WIN no Martingale — ${tradeDisplay.multiplier.toFixed(2)}x`
                       : `❌ LOSS — ${tradeDisplay.multiplier.toFixed(2)}x`
@@ -885,11 +744,8 @@ export default function StrategiesPage() {
             </div>
           )
         }
-
-        const podeExibirSinal = marketPaying
-        if (!podeExibirSinal) return null
-        if (!sinalAtual)      return null
-
+        if (!marketPaying) return null
+        if (!sinalAtual)   return null
         if (sinalAtual.tipo === 'entrar') return (
           <div className="rounded-2xl border p-3.5" style={{ borderColor: C.green + '50', background: C.green + '0e' }}>
             <div className="flex items-start gap-3">
@@ -898,15 +754,12 @@ export default function StrategiesPage() {
                 <p className="text-[10px] text-white/35 uppercase tracking-widest mb-0.5">{selected.name}</p>
                 <p className="text-sm font-semibold text-white leading-snug">{sinalAtual.msg}</p>
                 {wppConfig.lastSentAt && (
-                  <p className="text-[10px] text-white/25 mt-1">
-                    Último envio: {new Date(wppConfig.lastSentAt).toLocaleTimeString('pt-BR')}
-                  </p>
+                  <p className="text-[10px] text-white/25 mt-1">Último envio: {new Date(wppConfig.lastSentAt).toLocaleTimeString('pt-BR')}</p>
                 )}
               </div>
             </div>
           </div>
         )
-
         if (sinalAtual.tipo === 'pre_sinal') return (
           <div className="rounded-2xl border p-3.5" style={{ borderColor: C.amber + '50', background: C.amber + '0e' }}>
             <div className="flex items-start gap-3">
@@ -918,7 +771,6 @@ export default function StrategiesPage() {
             </div>
           </div>
         )
-
         return (
           <div className="rounded-2xl border p-3.5" style={{ borderColor: sinalAtual.color + '50', background: sinalAtual.color + '0e' }}>
             <div className="flex items-start gap-3">
@@ -939,51 +791,36 @@ export default function StrategiesPage() {
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
         {strategies.map(s => {
-          const isActive    = selectedId === s.id
-          const stats       = allStats[s.id]
-          const cardSignal  = allSignals[s.id]
-          const isBest      = bestId === s.id
+          const isActive   = selectedId === s.id
+          const stats      = allStats[s.id]
+          const cardSignal = allSignals[s.id]
+          const isBest     = bestId === s.id
           const statusBadge = !isActive && cardSignal
-            ? cardSignal.tipo === 'entrar'    ? { color: C.green,  label: 'entraria agora', glow: true  }
-            : cardSignal.tipo === 'pre_sinal' ? { color: C.amber,  label: 'pré-sinal',      glow: true  }
-            : cardSignal.tipo === 'bloqueado' ? { color: C.amber,  label: 'bloqueado',       glow: false }
-            :                                  { color: C.muted,   label: 'aguardando',      glow: false }
+            ? cardSignal.tipo === 'entrar'    ? { color: C.green, label: 'entraria agora', glow: true  }
+            : cardSignal.tipo === 'pre_sinal' ? { color: C.amber, label: 'pré-sinal',      glow: true  }
+            : cardSignal.tipo === 'bloqueado' ? { color: C.amber, label: 'bloqueado',       glow: false }
+            :                                  { color: C.muted,  label: 'aguardando',      glow: false }
             : null
-
           return (
-            <div key={s.id}
-              onClick={() => setSelectedId(isActive ? null : s.id)}
+            <div key={s.id} onClick={() => setSelectedId(isActive ? null : s.id)}
               className="rounded-2xl border p-4 cursor-pointer transition-all duration-150 space-y-3 select-none"
-              style={{
-                borderColor: isActive ? C.purple + '70' : isBest ? C.green + '35' : 'rgba(255,255,255,0.07)',
-                background:  isActive ? C.purple + '12' : 'rgba(255,255,255,0.015)',
-              }}
-            >
+              style={{ borderColor: isActive ? C.purple + '70' : isBest ? C.green + '35' : 'rgba(255,255,255,0.07)', background: isActive ? C.purple + '12' : 'rgba(255,255,255,0.015)' }}>
               <div className="flex items-center gap-2.5">
                 <span style={{ color: isActive ? C.purple : 'rgba(255,255,255,0.35)' }}>{s.icon}</span>
                 <h3 className="text-sm font-semibold text-white/85 flex-1 leading-snug">{s.name}</h3>
-
                 {isBest && !isActive && (
                   <span className="flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full border shrink-0"
                     style={{ color: C.green, borderColor: C.green + '40', background: C.green + '10' }}>
                     <Trophy className="h-2.5 w-2.5" /> top
                   </span>
                 )}
-
                 {!isActive && statusBadge && (
                   <span className="flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full border shrink-0"
-                    style={{
-                      color:       statusBadge.color,
-                      borderColor: statusBadge.color + '40',
-                      background:  statusBadge.color + '10',
-                      boxShadow:   statusBadge.glow ? `0 0 8px ${statusBadge.color}50` : 'none',
-                    }}
-                  >
+                    style={{ color: statusBadge.color, borderColor: statusBadge.color + '40', background: statusBadge.color + '10', boxShadow: statusBadge.glow ? `0 0 8px ${statusBadge.color}50` : 'none' }}>
                     <span className="h-1.5 w-1.5 rounded-full" style={{ background: statusBadge.color }} />
                     {statusBadge.label}
                   </span>
                 )}
-
                 {isActive && (
                   <div className="flex items-center gap-1.5">
                     {wppConfig.enabled && (
@@ -992,28 +829,22 @@ export default function StrategiesPage() {
                         <MessageCircle className="h-2.5 w-2.5" />
                       </span>
                     )}
-                    <div className="h-2 w-2 rounded-full shrink-0"
-                      style={{ background: C.green, boxShadow: `0 0 6px ${C.green}` }} />
+                    <div className="h-2 w-2 rounded-full shrink-0" style={{ background: C.green, boxShadow: `0 0 6px ${C.green}` }} />
                   </div>
                 )}
               </div>
-
               {stats && stats.total > 0
                 ? <StatsRow stats={stats} />
                 : <p className="text-[11px] text-white/20">Calculando estatísticas (aguardando mercado pagar)...</p>
               }
-
               {isActive && s.configFields && (
                 <div className="flex gap-3 flex-wrap" onClick={e => e.stopPropagation()}>
                   {s.configFields.map(f => (
                     <div key={f.key}>
                       <p className="text-[10px] text-white/30 mb-1">{f.label}</p>
-                      <input
-                        type={f.type}
-                        defaultValue={stratConfig[f.key] ?? f.defaultValue}
+                      <input type={f.type} defaultValue={stratConfig[f.key] ?? f.defaultValue}
                         onChange={e => setStratConfig(c => ({ ...c, [f.key]: e.target.value }))}
-                        className="w-24 text-xs bg-white/[0.07] border border-white/15 rounded-lg px-2 py-1.5 text-white focus:outline-none focus:border-white/30"
-                      />
+                        className="w-24 text-xs bg-white/[0.07] border border-white/15 rounded-lg px-2 py-1.5 text-white focus:outline-none focus:border-white/30" />
                     </div>
                   ))}
                 </div>
