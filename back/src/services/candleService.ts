@@ -2,20 +2,20 @@ import { v4 as uuidv4 } from 'uuid'
 import { calcularCor } from '../utils/colorCalc.js'
 import { logger } from '../utils/logger.js'
 import { EventEmitter } from 'events'
-import { alertMarketPaying, getPayThreshold, isConfigured as wppConfigured } from './whatsappService.js'
+
+// ─── REMOVIDO: alertMarketPaying, getPayThreshold, isConfigured ───────────────
+// O alerta de mercado pagando é responsabilidade EXCLUSIVA do frontend
+// (StrategiesPage.tsx), que analisa a janela de 60 velas e a % de azuis.
+// O backend NÃO deve disparar alertas baseados em multiplicador individual —
+// isso causava falsos positivos toda vez que qualquer vela chegasse com mult ≥ 2.
 
 // Janela de tempo para considerar que uma vela WS "é a mesma" que uma histórica.
-// O histórico tem timestamps estimados (agora - posição * 30s), então uma vela
-// que chegou via WS com valor igual e timestamp próximo do estimado é duplicata.
 const HIST_REPLACE_WINDOW_MS = 90_000 // 90 segundos de tolerância por posição
 
 class CandleService extends EventEmitter {
   private candles: any[]
   private totalCaptured: number
   private emittedRoundIds: Set<string>
-
-  // Mapa de velas históricas: chave = mult arredondado, valor = array de candles históricos
-  // Usado para detectar quando uma vela WS real corresponde a uma histórica
   private historicalByValue: Map<string, any[]>
 
   constructor() {
@@ -37,13 +37,11 @@ class CandleService extends EventEmitter {
   }
 
   // ─── Verifica se uma vela WS substitui uma histórica ────────────────────────
-  // Retorna o índice da vela histórica a ser substituída, ou -1 se não encontrar.
   private findHistoricalMatch(mult: number, wsTimestamp: number): number {
     const key = Number(mult).toFixed(2)
     const candidates = this.historicalByValue.get(key)
     if (!candidates || candidates.length === 0) return -1
 
-    // Encontra a vela histórica cujo timestamp estimado é mais próximo do WS
     let bestIdx  = -1
     let bestDiff = Infinity
 
@@ -73,7 +71,6 @@ class CandleService extends EventEmitter {
       const matchIdx = this.findHistoricalMatch(multiplicador, wsTs)
 
       if (matchIdx !== -1) {
-        // Substitui a vela histórica pela vela real mantendo posição no array
         const old = this.candles[matchIdx]
 
         // Remove do índice de histórico
@@ -85,10 +82,8 @@ class CandleService extends EventEmitter {
           if (arr.length === 0) this.historicalByValue.delete(key)
         }
 
-        // Remove rodada_id antigo do set
         if (old.rodada_id) this.emittedRoundIds.delete(old.rodada_id)
 
-        // Cria vela real no lugar da histórica
         const candle = {
           ...old,
           rodada_id,
@@ -101,9 +96,7 @@ class CandleService extends EventEmitter {
         this.totalCaptured++
         this.emit('new_candle', candle)
 
-        if (wppConfigured() && multiplicador >= getPayThreshold()) {
-          alertMarketPaying().catch(() => {})
-        }
+        // ✅ REMOVIDO: alertMarketPaying() — não é papel do backend decidir isso
 
         return candle
       }
@@ -120,7 +113,6 @@ class CandleService extends EventEmitter {
     }
 
     if (isHistorical) {
-      // Inserção ordenada por timestamp para histórico
       const t = new Date(timestamp).getTime()
       let lo = 0, hi = this.candles.length
       while (lo < hi) {
@@ -130,12 +122,10 @@ class CandleService extends EventEmitter {
       }
       this.candles.splice(lo, 0, candle)
 
-      // Registra no índice de histórico para futura substituição
       const key = Number(multiplicador).toFixed(2)
       if (!this.historicalByValue.has(key)) this.historicalByValue.set(key, [])
       this.historicalByValue.get(key)!.push(candle)
 
-      // Remove do índice após 10 minutos (histórico já foi absorvido pelo WS)
       setTimeout(() => {
         const arr = this.historicalByValue.get(key)
         if (arr) {
@@ -155,9 +145,7 @@ class CandleService extends EventEmitter {
 
     this.emit('new_candle', candle)
 
-    if (wppConfigured() && multiplicador >= getPayThreshold()) {
-      alertMarketPaying().catch(() => {})
-    }
+    // ✅ REMOVIDO: alertMarketPaying() — não é papel do backend decidir isso
 
     return candle
   }

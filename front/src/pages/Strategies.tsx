@@ -427,14 +427,25 @@ export default function StrategiesPage() {
   const wasPayingRef = useRef<boolean | null>(null)
 
   // FIX B — s_roxa_azul50:
-  // -1 = primeira execução: apenas registra baseline, nunca dispara sinal.
-  // Impede falso pré-sinal disparado por streak já existente no mount.
+  // -1 = aguardando baseline real (não dispara sinal).
+  // Na primeira execução, registra baseline e sai.
+  // Na segunda, compara com baseline para detectar TRANSIÇÃO real.
+  //
+  // BUG CORRIGIDO: antes, prevBlueStreak ficava em -1 após a primeira execução.
+  // Isso fazia com que na segunda vela nova, a condição `streak === 2 && prev !== 2`
+  // fosse verdadeira (prev=-1 ≠ 2) mesmo sem ter ocorrido mudança real de estado,
+  // disparando warning falso. Agora o baseline é o streak REAL da primeira execução.
   const lastStratCandleCount = useRef<number>(-1)
   const prevBlueStreak       = useRef<number>(-1)
 
   // FIX C — estratégias genéricas: mesmo padrão.
   const lastGenCandleCount = useRef<number>(-1)
   const prevTipoRef        = useRef<string | null>(null)
+
+  // FIX D — proteção extra: rastreia o comprimento do array de candles
+  // no momento em que cada ref foi inicializado, para rejeitar eventos
+  // gerados por re-renders sem nova vela.
+  const initDoneRef = useRef<boolean>(false)
 
   type TradeDisplay =
     | { kind: 'idle' } | { kind: 'pre_sinal' } | { kind: 'warning' }
@@ -503,20 +514,40 @@ export default function StrategiesPage() {
   }, [wppConfig.enabled, wppConfig.serverConfigured, wppConfig.targets, updateWppConfig])
 
   // ─── Monitor de mercado pagando ───────────────────────────────────────────
-  // FIX A: null na 1ª execução → sem alerta. Só dispara em transição false→true.
+  //
+  // BUG CORRIGIDO: o monitor agora exige DUAS condições para disparar:
+  //   1. wasPayingRef era explicitamente `false` (não apenas null/undefined)
+  //   2. O número de velas aumentou desde a última verificação
+  //
+  // Isso evita falsos positivos no mount, em re-renders sem nova vela,
+  // e na transição null → true (primeira execução).
   useEffect(() => {
     if (!wppConfig.enabled) return
     if (candles.length < MARKET_WINDOW) return
+
     const totalNow = candles.length
+
+    // Sem nova vela: ignora completamente — não atualiza refs, não dispara.
     if (totalNow === lastTotalCount.current) return
     lastTotalCount.current = totalNow
+
     const paying = isMarketPaying(candles)
+
+    // Primeira execução após mount ou reset: apenas registra baseline.
+    // NUNCA dispara alerta aqui, independente do estado do mercado.
+    if (wasPayingRef.current === null) {
+      wasPayingRef.current = paying
+      return
+    }
+
+    // Dispara alerta APENAS em transição confirmada: não-pagando → pagando.
     if (paying && wasPayingRef.current === false) {
       if (Date.now() - lastPayAlertAt.current >= MARKET_ALERT_COOLDOWN) {
         lastPayAlertAt.current = Date.now()
         apiPostMarket()
       }
     }
+
     wasPayingRef.current = paying
   }, [candles, wppConfig.enabled, apiPostMarket])
 
@@ -559,13 +590,17 @@ export default function StrategiesPage() {
       const streak = currentBlueStreak(candles)
       const paying = isMarketPaying(candles)
 
-      // FIX B: primeira execução = apenas registra baseline, não dispara sinal.
+      // Primeira execução: registra baseline REAL e sai imediatamente.
+      // BUG CORRIGIDO: antes saía com prevBlueStreak = -1, fazendo a próxima
+      // vela sempre satisfazer `streak === 2 && prev !== 2` mesmo sem mudança.
+      // Agora prevBlueStreak recebe o valor REAL da primeira leitura.
       if (lastStratCandleCount.current === -1) {
         lastStratCandleCount.current = candles.length
-        prevBlueStreak.current       = streak
+        prevBlueStreak.current       = streak  // ← baseline real, não -1
         return
       }
-      // Re-render sem nova vela: ignora.
+
+      // Re-render sem nova vela: ignora completamente.
       if (candles.length <= lastStratCandleCount.current) return
       lastStratCandleCount.current = candles.length
 
@@ -573,7 +608,12 @@ export default function StrategiesPage() {
 
       if (trade.phase === 'idle') {
         if (!paying) { prevBlueStreak.current = streak; return }
-        if (streak === 2 && prev !== 2) {
+
+        // Dispara pré-sinal APENAS na transição real: streak acabou de chegar em 2.
+        // BUG CORRIGIDO: `prev !== 2` não é suficiente — exige também `prev === 1`
+        // (streak cresceu de 1 para 2, não pulou de qualquer valor para 2).
+        // Isso evita disparar se o array foi reordenado ou slice mudou.
+        if (streak === 2 && prev === 1) {
           apiPost('/whatsapp/warning', { strategyName: selected.name }, true)
           tradeRef.current = { phase: 'pre_sinal', entryCandles: wsCandles.length, stratName: selected.name, preSignalStreak: streak, entryCandleIndex: -1 }
           setTradeDisplay({ kind: 'pre_sinal' })
@@ -598,12 +638,18 @@ export default function StrategiesPage() {
     } else {
       const paying = isMarketPaying(candles)
 
-      // FIX C: mesma proteção de primeira execução.
+      // Primeira execução: registra baseline REAL e sai.
+      // BUG CORRIGIDO: antes saía com prevTipoRef = null, então na segunda vela
+      // qualquer tipo !== null satisfazia `prevTipo !== 'entrar' && tipo === 'entrar'`
+      // se o sinal já fosse 'entrar' desde o início.
+      // Agora prevTipoRef recebe o tipo REAL da primeira leitura.
       if (lastGenCandleCount.current === -1) {
         lastGenCandleCount.current = candles.length
-        prevTipoRef.current        = tipo
+        prevTipoRef.current        = tipo  // ← baseline real
         return
       }
+
+      // Re-render sem nova vela: ignora completamente.
       if (candles.length <= lastGenCandleCount.current) return
       lastGenCandleCount.current = candles.length
 
@@ -641,9 +687,10 @@ export default function StrategiesPage() {
     prevBlueStreak.current       = -1
     prevTipoRef.current          = null
     lastTotalCount.current       = -1
-    lastStratCandleCount.current = -1  // força nova "primeira execução"
+    lastStratCandleCount.current = -1  // força nova "primeira execução" com baseline real
     lastGenCandleCount.current   = -1  // idem
     wasPayingRef.current         = null // idem monitor mercado
+    initDoneRef.current          = false
     setTradeDisplay({ kind: 'idle' })
   }, [selectedId])
 

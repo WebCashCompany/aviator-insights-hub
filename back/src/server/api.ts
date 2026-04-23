@@ -12,7 +12,6 @@ import {
   alertResult,
   testConnection,
   isConfigured,
-  getPayThreshold,
   setSavedTargets,
   getSavedTargets,
   startConnection,
@@ -25,11 +24,9 @@ import {
 
 const router = express.Router()
 
-// ── Config do robô em memória (persiste enquanto o servidor estiver de pé) ─────
-// Para persistência total entre reinicializações, salve no Supabase.
 interface BotConfig {
-  enabled:          boolean
-  selectedStratId:  string | null
+  enabled:         boolean
+  selectedStratId: string | null
 }
 
 let botConfig: BotConfig = {
@@ -69,23 +66,14 @@ router.get('/debug/frames', (req, res) => {
 
 // ── Bot Config ─────────────────────────────────────────────────────────────────
 
-/**
- * GET /api/v1/bot/config
- * Retorna configuração atual do robô (estratégia + toggle)
- */
 router.get('/bot/config', (_req, res) => {
   res.json(botConfig)
 })
 
-/**
- * POST /api/v1/bot/config
- * Salva configuração do robô
- * Body: { enabled?: boolean, selectedStratId?: string | null }
- */
 router.post('/bot/config', (req, res) => {
   const { enabled, selectedStratId } = req.body
-  if (enabled          !== undefined) botConfig.enabled         = Boolean(enabled)
-  if (selectedStratId  !== undefined) botConfig.selectedStratId = selectedStratId ?? null
+  if (enabled         !== undefined) botConfig.enabled         = Boolean(enabled)
+  if (selectedStratId !== undefined) botConfig.selectedStratId = selectedStratId ?? null
   res.json({ ok: true, config: botConfig })
 })
 
@@ -93,10 +81,9 @@ router.post('/bot/config', (req, res) => {
 
 router.get('/whatsapp/status', (_req, res) => {
   res.json({
-    configured:   isConfigured(),
-    provider:     'baileys',
-    payThreshold: getPayThreshold(),
-    targets:      getSavedTargets(),
+    configured: isConfigured(),
+    provider:   'baileys',
+    targets:    getSavedTargets(),
   })
 })
 

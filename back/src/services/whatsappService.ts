@@ -1,11 +1,13 @@
 /**
  * whatsappService.ts — Baileys + sessão persistida no Supabase
  *
- * MUDANÇAS em relação à versão anterior:
- *  - Removido: useMultiFileAuthState (sessão em disco)
- *  - Adicionado: useSupabaseAuthState (sessão no Supabase)
- *  - logout() agora chama clearSession() para limpar o banco
- *  - Sem mais dependência de SESSION_PATH / pasta local
+ * CORREÇÃO DE BUG:
+ *  - alertMarketPaying() NÃO deve ser chamado pelo candleService.
+ *  - O backend não tem como saber se o mercado está pagando — ele não analisa
+ *    janelas de velas nem % de azuis. Isso é responsabilidade do frontend.
+ *  - O único caminho correto é: frontend detecta transição → chama POST /whatsapp/market-paying
+ *  - Removidos: getPayThreshold(), isConfigured() como exports para candleService
+ *  - isConfigured() mantida apenas para uso interno das rotas HTTP
  */
 
 import {
@@ -23,8 +25,7 @@ import { EventEmitter } from 'events'
 import { useSupabaseAuthState } from './supabaseAuthState.js'
 
 // ─── Config ───────────────────────────────────────────────────────────────────
-const PAY_THRESHOLD      = parseFloat(process.env.WPP_PAY_THRESHOLD   || '2')
-const MIN_INTERVAL       = parseInt(process.env.WPP_MIN_INTERVAL_MS   || '5000')
+const MIN_INTERVAL       = parseInt(process.env.WPP_MIN_INTERVAL_MS || '5000')
 const PAY_ALERT_COOLDOWN = 10 * 60 * 1000 // 10 min
 
 const silentChild: any = {
@@ -46,7 +47,7 @@ interface WppState {
   contacts:       { id: string; name: string; phone: string }[]
   targets:        string[]
   lastPayAlertAt: number
-  clearSession:   (() => Promise<void>) | null   // ← referência para limpar banco no logout
+  clearSession:   (() => Promise<void>) | null
 }
 
 const state: WppState = {
@@ -70,7 +71,6 @@ export function setSavedTargets(t: string[]): void                 { state.targe
 export function getGroups():                  WppState['groups']   { return state.groups }
 export function getContacts():                WppState['contacts'] { return state.contacts }
 export function isConfigured():               boolean              { return state.conn === 'open' }
-export function getPayThreshold():            number               { return PAY_THRESHOLD }
 
 // ─── Retry ────────────────────────────────────────────────────────────────────
 function scheduleRetry(): void {
@@ -93,7 +93,6 @@ export async function startConnection(): Promise<void> {
   wppEvents.emit('state', 'connecting')
 
   try {
-    // ✅ Sessão vem do Supabase — sobrevive a reinicializações e é multi-instância
     const { state: authState, saveCreds, clearSession } = await useSupabaseAuthState()
     state.clearSession = clearSession
 
@@ -106,12 +105,12 @@ export async function startConnection(): Promise<void> {
         creds: authState.creds,
         keys:  makeCacheableSignalKeyStore(authState.keys, undefined as any),
       },
-      syncFullHistory:              false,
+      syncFullHistory:                false,
       generateHighQualityLinkPreview: false,
-      browser:                      ['Ubuntu', 'Chrome', '22.0.0.75'],
-      logger:                       silentChild,
-      connectTimeoutMs:             60_000,
-      keepAliveIntervalMs:          10_000,
+      browser:                        ['Ubuntu', 'Chrome', '22.0.0.75'],
+      logger:                         silentChild,
+      connectTimeoutMs:               60_000,
+      keepAliveIntervalMs:            10_000,
     })
 
     state.socket = sock
@@ -127,13 +126,13 @@ export async function startConnection(): Promise<void> {
       }
 
       if (connection === 'open') {
-        state.conn        = 'open'
-        state.qrBase64    = null
+        state.conn         = 'open'
+        state.qrBase64     = null
         state.isConnecting = false
-        state.retryCount  = 0
+        state.retryCount   = 0
         if (state.retryTimer) { clearTimeout(state.retryTimer); state.retryTimer = null }
         wppEvents.emit('state', 'open')
-        logger.info('[WPP] ✅ WhatsApp conectado! (sessão persistida no Supabase)')
+        logger.info('[WPP] ✅ WhatsApp conectado!')
         await loadGroupsAndContacts(sock)
       }
 
@@ -145,7 +144,6 @@ export async function startConnection(): Promise<void> {
         state.isConnecting = false
 
         if (reason === DisconnectReason.loggedOut) {
-          // Logout explícito: remove sessão do banco para forçar novo QR
           await state.clearSession?.()
           state.conn       = 'close'
           state.retryCount = 0
@@ -200,14 +198,13 @@ export async function disconnect(): Promise<void> {
     state.socket = null
   }
 
-  // Remove a sessão do Supabase para que o próximo connect exija novo QR
   await state.clearSession?.()
   state.clearSession = null
 
-  state.conn      = 'close'
-  state.qrBase64  = null
-  state.groups    = []
-  state.contacts  = []
+  state.conn     = 'close'
+  state.qrBase64 = null
+  state.groups   = []
+  state.contacts = []
   wppEvents.emit('state', 'close')
   logger.info('[WPP] Desconectado e sessão removida do Supabase')
 }
@@ -232,12 +229,25 @@ function hora(): string { return new Date().toLocaleTimeString('pt-BR') }
 
 // ─── Alertas ──────────────────────────────────────────────────────────────────
 
+/**
+ * alertMarketPaying — chamado EXCLUSIVAMENTE via rota HTTP POST /whatsapp/market-paying
+ * que o FRONTEND dispara após detectar transição real (não-pagando → pagando).
+ *
+ * NÃO deve ser importado nem chamado pelo candleService ou qualquer outro serviço
+ * de backend. O backend não analisa janela de velas — isso é papel do frontend.
+ */
 export async function alertMarketPaying(targets?: string[]): Promise<void> {
   if (state.conn !== 'open') return
   const dest = targets?.length ? targets : getSavedTargets()
   if (!dest.length) return
-  if (Date.now() - state.lastPayAlertAt < PAY_ALERT_COOLDOWN) return
+
+  // Cooldown server-side como segunda linha de defesa contra duplicatas
+  if (Date.now() - state.lastPayAlertAt < PAY_ALERT_COOLDOWN) {
+    logger.info('[WPP] alertMarketPaying ignorado — cooldown ativo')
+    return
+  }
   state.lastPayAlertAt = Date.now()
+
   const msg =
     `🟢 *GRÁFICO EM MOMENTO FAVORÁVEL*\n` +
     `━━━━━━━━━━━━━━━━━━━━\n` +
@@ -350,7 +360,7 @@ export async function testConnection(): Promise<{ ok: boolean; error?: string }>
   } catch (e: any) { return { ok: false, error: e.message } }
 }
 
-/** @deprecated use alertMarketPaying */
+/** @deprecated use alertWarning + alertConfirmed */
 export async function alertStrategySignal(strategyName: string, signalMsg: string, targets?: string[]): Promise<void> {
   if (state.conn !== 'open') return
   const dest = targets?.length ? targets : getSavedTargets()
