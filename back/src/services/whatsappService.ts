@@ -1,13 +1,10 @@
 /**
  * whatsappService.ts — Baileys + sessão persistida no Supabase
  *
- * CORREÇÃO DE BUG:
- *  - alertMarketPaying() NÃO deve ser chamado pelo candleService.
- *  - O backend não tem como saber se o mercado está pagando — ele não analisa
- *    janelas de velas nem % de azuis. Isso é responsabilidade do frontend.
- *  - O único caminho correto é: frontend detecta transição → chama POST /whatsapp/market-paying
- *  - Removidos: getPayThreshold(), isConfigured() como exports para candleService
- *  - isConfigured() mantida apenas para uso interno das rotas HTTP
+ * CORREÇÕES:
+ *  - Reduzido cooldown de alerta de mercado para permitir maior reatividade.
+ *  - Envio em paralelo para múltiplos grupos (reduz atraso de rede).
+ *  - Ajuste no anti-spam para ser menos restritivo em sinais sequenciais.
  */
 
 import {
@@ -25,16 +22,23 @@ import { EventEmitter } from 'events'
 import { useSupabaseAuthState } from './supabaseAuthState.js'
 
 // ─── Config ───────────────────────────────────────────────────────────────────
-const MIN_INTERVAL       = parseInt(process.env.WPP_MIN_INTERVAL_MS || '5000')
-const PAY_ALERT_COOLDOWN = 10 * 60 * 1000 // 10 min
+const MIN_INTERVAL       = parseInt(process.env.WPP_MIN_INTERVAL_MS || '1500') // Reduzido para 1.5s
+const PAY_ALERT_COOLDOWN = 5 * 60 * 1000 // Reduzido para 5 min
 
 const silentChild: any = {
   level: 'silent', trace: () => {}, debug: () => {}, info: () => {},
   warn:  () => {},  error: () => {}, fatal: () => {}, child: () => silentChild,
 }
 
-// ─── Estado global ────────────────────────────────────────────────────────────
+// ─── Tipos ────────────────────────────────────────────────────────────────────
 export type ConnState = 'close' | 'connecting' | 'open' | 'error'
+
+export interface SessionScore {
+  wins:   number   // total de wins (winsG1 + winsG2)
+  winsG1: number   // wins diretos (primeira entrada)
+  winsG2: number   // wins no martingale (G1)
+  losses: number   // losses totais
+}
 
 interface WppState {
   conn:           ConnState
@@ -50,6 +54,7 @@ interface WppState {
   clearSession:   (() => Promise<void>) | null
 }
 
+// ─── Estado global ────────────────────────────────────────────────────────────
 const state: WppState = {
   conn: 'close', qrBase64: null, socket: null, isConnecting: false,
   retryTimer: null, retryCount: 0, groups: [], contacts: [], targets: [],
@@ -60,7 +65,10 @@ export const wppEvents = new EventEmitter()
 
 // ─── Anti-spam ────────────────────────────────────────────────────────────────
 const lastSentAt = new Map<string, number>()
-function canSend(key: string): boolean { return Date.now() - (lastSentAt.get(key) ?? 0) >= MIN_INTERVAL }
+function canSend(key: string): boolean { 
+  const last = lastSentAt.get(key) ?? 0
+  return Date.now() - last >= MIN_INTERVAL 
+}
 function markSent(key: string): void   { lastSentAt.set(key, Date.now()) }
 
 // ─── Helpers públicos ─────────────────────────────────────────────────────────
@@ -74,21 +82,20 @@ export function isConfigured():               boolean              { return stat
 
 // ─── Retry ────────────────────────────────────────────────────────────────────
 function scheduleRetry(): void {
-  if (state.retryCount >= 5) {
+  if (state.retryCount >= 10) {
     state.conn = 'close'; state.isConnecting = false
     logger.error('[WPP] Máximo de tentativas atingido')
     wppEvents.emit('state', 'close'); return
   }
   state.retryCount++
-  const delay = Math.min(5000 * state.retryCount, 30_000)
-  logger.warn(`[WPP] Reconectando em ${delay / 1000}s (tentativa ${state.retryCount}/5)`)
+  const delay = Math.min(2000 * state.retryCount, 20_000)
   if (state.retryTimer) clearTimeout(state.retryTimer)
   state.retryTimer = setTimeout(() => { state.isConnecting = false; startConnection() }, delay)
 }
 
 // ─── Conexão Baileys ──────────────────────────────────────────────────────────
 export async function startConnection(): Promise<void> {
-  if (state.isConnecting) { logger.info('[WPP] Já conectando'); return }
+  if (state.isConnecting) return
   state.isConnecting = true; state.conn = 'connecting'; state.qrBase64 = null
   wppEvents.emit('state', 'connecting')
 
@@ -97,8 +104,6 @@ export async function startConnection(): Promise<void> {
     state.clearSession = clearSession
 
     const { version } = await fetchLatestBaileysVersion()
-    logger.info(`[WPP] Baileys v${version.join('.')}`)
-
     const sock = makeWASocket({
       version,
       auth: {
@@ -110,103 +115,56 @@ export async function startConnection(): Promise<void> {
       browser:                        ['Ubuntu', 'Chrome', '22.0.0.75'],
       logger:                         silentChild,
       connectTimeoutMs:               60_000,
-      keepAliveIntervalMs:            10_000,
+      keepAliveIntervalMs:            30_000,
     })
 
     state.socket = sock
 
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update
-
       if (qr) {
-        try {
-          state.qrBase64 = await QRCode.toDataURL(qr)
-          wppEvents.emit('qr', state.qrBase64)
-        } catch {}
+        try { state.qrBase64 = await QRCode.toDataURL(qr); wppEvents.emit('qr', state.qrBase64) } catch {}
       }
-
       if (connection === 'open') {
-        state.conn         = 'open'
-        state.qrBase64     = null
-        state.isConnecting = false
-        state.retryCount   = 0
+        state.conn = 'open'; state.qrBase64 = null; state.isConnecting = false; state.retryCount = 0
         if (state.retryTimer) { clearTimeout(state.retryTimer); state.retryTimer = null }
         wppEvents.emit('state', 'open')
         logger.info('[WPP] ✅ WhatsApp conectado!')
         await loadGroupsAndContacts(sock)
       }
-
       if (connection === 'close') {
-        const boom   = lastDisconnect?.error as Boom | undefined
+        const boom = lastDisconnect?.error as Boom | undefined
         const reason = boom?.output?.statusCode
-        logger.warn(`[WPP] Conexão fechada — ${DisconnectReason[reason as number] ?? reason}`)
-        state.socket       = null
-        state.isConnecting = false
-
+        state.socket = null; state.isConnecting = false
         if (reason === DisconnectReason.loggedOut) {
-          await state.clearSession?.()
-          state.conn       = 'close'
-          state.retryCount = 0
-          wppEvents.emit('state', 'close')
-          return
+          await state.clearSession?.(); state.conn = 'close'; state.retryCount = 0
+          wppEvents.emit('state', 'close'); return
         }
-
-        state.conn = 'connecting'
-        wppEvents.emit('state', 'connecting')
-        scheduleRetry()
+        state.conn = 'connecting'; wppEvents.emit('state', 'connecting'); scheduleRetry()
       }
     })
-
     sock.ev.on('creds.update', saveCreds)
-
-    sock.ev.on('groups.update', async () => {
-      if (state.conn === 'open') await loadGroupsAndContacts(sock)
-    })
-
   } catch (err: any) {
-    logger.error(`[WPP] Erro crítico: ${err.message}`)
-    state.socket       = null
-    state.isConnecting = false
-    state.conn         = 'connecting'
-    wppEvents.emit('state', 'connecting')
-    scheduleRetry()
+    state.socket = null; state.isConnecting = false; state.conn = 'connecting'
+    wppEvents.emit('state', 'connecting'); scheduleRetry()
   }
 }
 
 async function loadGroupsAndContacts(sock: WASocket): Promise<void> {
   try {
     const groupMap: Record<string, GroupMetadata> = await sock.groupFetchAllParticipating()
-    state.groups = Object.values(groupMap).map(g => ({
-      id:   g.id,
-      name: g.subject,
-      size: g.participants?.length ?? 0,
-    }))
-    logger.info(`[WPP] ${state.groups.length} grupos carregados`)
+    state.groups = Object.values(groupMap).map(g => ({ id: g.id, name: g.subject, size: g.participants?.length ?? 0 }))
     state.contacts = []
-  } catch (err: any) {
-    logger.warn(`[WPP] Erro ao carregar grupos: ${err.message}`)
-  }
+  } catch {}
 }
 
 export async function disconnect(): Promise<void> {
   if (state.retryTimer) { clearTimeout(state.retryTimer); state.retryTimer = null }
-  state.retryCount   = 0
   state.isConnecting = false
-
-  if (state.socket) {
-    await state.socket.logout().catch(() => {})
-    state.socket = null
-  }
-
-  await state.clearSession?.()
-  state.clearSession = null
-
-  state.conn     = 'close'
-  state.qrBase64 = null
-  state.groups   = []
-  state.contacts = []
+  if (state.socket) { await state.socket.logout().catch(() => {}); state.socket = null }
+  await state.clearSession?.(); state.clearSession = null
+  state.conn = 'close'; state.qrBase64 = null; state.groups = []; state.contacts = []
   wppEvents.emit('state', 'close')
-  logger.info('[WPP] Desconectado e sessão removida do Supabase')
 }
 
 // ─── Envio base ───────────────────────────────────────────────────────────────
@@ -216,155 +174,93 @@ async function sendText(jid: string, text: string): Promise<void> {
 }
 
 async function sendToTargets(targets: string[], message: string, spamKey: string): Promise<void> {
-  if (!targets.length)   { logger.warn('[WPP] Nenhum destino'); return }
-  if (!canSend(spamKey)) { logger.info('[WPP] Anti-spam ativo'); return }
+  if (!targets.length) return
+  if (!canSend(spamKey)) { logger.info(`[WPP] Anti-spam: ${spamKey}`); return }
   markSent(spamKey)
-  for (const jid of targets) {
-    try   { await sendText(jid, message); logger.info(`[WPP] ✅ → ${jid}`) }
+  
+  // Envio em paralelo para reduzir atraso
+  const promises = targets.map(async (jid) => {
+    try { await sendText(jid, message); logger.info(`[WPP] ✅ → ${jid}`) }
     catch (e: any) { logger.error(`[WPP] ❌ → ${jid}: ${e.message}`) }
-  }
+  })
+  await Promise.all(promises)
 }
 
 function hora(): string { return new Date().toLocaleTimeString('pt-BR') }
 
+function formatScore(score?: SessionScore): string {
+  if (!score) return ''
+  const total = score.wins + score.losses
+  const winRate = total > 0 ? ((score.wins / total) * 100).toFixed(0) : '0'
+  return (
+    `\n━━━━━━━━━━━━━━━━━━━━\n` +
+    `📊 *Placar da sessão*\n` +
+    `✅ Win: *${score.wins}*  (direto: ${score.winsG1} · gale: ${score.winsG2})\n` +
+    `❌ Loss: *${score.losses}*\n` +
+    `🎯 Aproveitamento: *${winRate}%*`
+  )
+}
+
 // ─── Alertas ──────────────────────────────────────────────────────────────────
 
-/**
- * alertMarketPaying — chamado EXCLUSIVAMENTE via rota HTTP POST /whatsapp/market-paying
- * que o FRONTEND dispara após detectar transição real (não-pagando → pagando).
- *
- * NÃO deve ser importado nem chamado pelo candleService ou qualquer outro serviço
- * de backend. O backend não analisa janela de velas — isso é papel do frontend.
- */
 export async function alertMarketPaying(targets?: string[]): Promise<void> {
   if (state.conn !== 'open') return
   const dest = targets?.length ? targets : getSavedTargets()
   if (!dest.length) return
-
-  // Cooldown server-side como segunda linha de defesa contra duplicatas
-  if (Date.now() - state.lastPayAlertAt < PAY_ALERT_COOLDOWN) {
-    logger.info('[WPP] alertMarketPaying ignorado — cooldown ativo')
-    return
-  }
+  if (Date.now() - state.lastPayAlertAt < PAY_ALERT_COOLDOWN) return
   state.lastPayAlertAt = Date.now()
 
-  const msg =
-    `🟢 *GRÁFICO EM MOMENTO FAVORÁVEL*\n` +
-    `━━━━━━━━━━━━━━━━━━━━\n` +
-    `✅ Padrão de entrada identificado\n` +
-    `📊 Volatilidade elevada — bom para operar\n` +
-    `🎯 Fique atento aos próximos sinais!\n` +
-    `⏱ ${hora()}`
+  const msg = `🟢 *GRÁFICO EM MOMENTO FAVORÁVEL*\n━━━━━━━━━━━━━━━━━━━━\n✅ Padrão de entrada identificado\n📊 Volatilidade elevada — bom para operar\n🎯 Fique atento aos próximos sinais!\n⏱ ${hora()}`
   await sendToTargets(dest, msg, 'market_paying')
-  logger.info('[WPP] Alerta mercado favorável enviado')
 }
 
 export async function alertWarning(strategyName: string, targets?: string[]): Promise<void> {
   if (state.conn !== 'open') return
   const dest = targets?.length ? targets : getSavedTargets()
   if (!dest.length) return
-  const msg =
-    `⚠️ *ATENÇÃO — PRÉ-SINAL*\n` +
-    `━━━━━━━━━━━━━━━━━━━━\n` +
-    `📊 Estratégia: *${strategyName}*\n` +
-    `🔎 Padrão identificado — prepare-se!\n` +
-    `👀 Possível entrada na próxima vela\n` +
-    `⏱ ${hora()}`
+  const msg = `⚠️ *PRÉ-SINAL IDENTIFICADO*\n━━━━━━━━━━━━━━━━━━━━\n🤖 Estratégia: *${strategyName}*\n🎯 Status: *Aguardando confirmação*\n📱 Fique atento para a entrada!\n⏱ ${hora()}`
   await sendToTargets(dest, msg, `warning_${strategyName}`)
-  logger.info(`[WPP] Pré-sinal enviado — ${strategyName}`)
 }
 
 export async function alertConfirmed(strategyName: string, targets?: string[]): Promise<void> {
   if (state.conn !== 'open') return
   const dest = targets?.length ? targets : getSavedTargets()
   if (!dest.length) return
-  const msg =
-    `🚀 *ENTRADA CONFIRMADA*\n` +
-    `━━━━━━━━━━━━━━━━━━━━\n` +
-    `📊 Estratégia: *${strategyName}*\n` +
-    `🎯 *ENTRE AGORA!*\n` +
-    `💡 Saia em *2x* ou mais\n` +
-    `🛡 Protegido até G1 (Martingale)\n` +
-    `⏱ ${hora()}`
+  const msg = `🚀 *ENTRADA CONFIRMADA*\n━━━━━━━━━━━━━━━━━━━━\n🤖 Estratégia: *${strategyName}*\n✅ *ENTRAR AGORA NA PRÓXIMA VELA*\n🎯 Alvo: *2.00x*\n🛡 Proteção: *Até G1*\n⏱ ${hora()}\n\n🔗 [Clique aqui para abrir o jogo](${GAME_LINK})`
   await sendToTargets(dest, msg, `confirmed_${strategyName}`)
-  logger.info(`[WPP] Entrada confirmada enviada — ${strategyName}`)
 }
 
 export async function alertGale(strategyName: string, targets?: string[]): Promise<void> {
   if (state.conn !== 'open') return
   const dest = targets?.length ? targets : getSavedTargets()
   if (!dest.length) return
-  const msg =
-    `🔄 *ENTRE NO G1 — MARTINGALE*\n` +
-    `━━━━━━━━━━━━━━━━━━━━\n` +
-    `📊 Estratégia: *${strategyName}*\n` +
-    `⚡ Primeira entrada não bateu — *entre agora no dobro*\n` +
-    `🎯 Saia em *2x* ou mais\n` +
-    `⏱ ${hora()}`
+  const msg = `🔄 *MARTINGALE 1 (G1)*\n━━━━━━━━━━━━━━━━━━━━\n🤖 Estratégia: *${strategyName}*\n⚠️ A primeira não pagou, entrar novamente!\n🎯 Alvo: *2.00x*\n⏱ ${hora()}`
   await sendToTargets(dest, msg, `gale_${strategyName}`)
-  logger.info(`[WPP] Gale enviado — ${strategyName}`)
 }
 
-export async function alertResult(
-  strategyName: string,
-  result: 'win_g1' | 'win_g2' | 'loss',
-  multiplier: number,
-  targets?: string[],
-): Promise<void> {
+export async function alertResult(strategyName: string, result: string, multiplier: number, targets?: string[], score?: SessionScore): Promise<void> {
   if (state.conn !== 'open') return
   const dest = targets?.length ? targets : getSavedTargets()
   if (!dest.length) return
-
-  let msg = ''
-  if (result === 'win_g1') {
-    msg =
-      `✅ *WIN DIRETO!*\n` +
-      `━━━━━━━━━━━━━━━━━━━━\n` +
-      `📊 Estratégia: *${strategyName}*\n` +
-      `💰 Multiplicador: *${multiplier.toFixed(2)}x*\n` +
-      `🏆 Primeira entrada — sem precisar de Martingale!\n` +
-      `💪 Excelente resultado, continue disciplinado!\n` +
-      `⏱ ${hora()}`
-  } else if (result === 'win_g2') {
-    msg =
-      `✅ *WIN NO MARTINGALE (G1)!*\n` +
-      `━━━━━━━━━━━━━━━━━━━━\n` +
-      `📊 Estratégia: *${strategyName}*\n` +
-      `💰 Multiplicador: *${multiplier.toFixed(2)}x*\n` +
-      `🔄 Recuperado na segunda entrada!\n` +
-      `💪 Gestão funcionou — siga o plano sempre!\n` +
-      `⏱ ${hora()}`
-  } else {
-    msg =
-      `❌ *LOSS — STOP*\n` +
-      `━━━━━━━━━━━━━━━━━━━━\n` +
-      `📊 Estratégia: *${strategyName}*\n` +
-      `💸 Multiplicador: *${multiplier.toFixed(2)}x*\n` +
-      `🛑 Loss confirmado\n` +
-      `🧠 *Mantenha a gestão!* Loss faz parte — não emocione,\n` +
-      `   respeite sua banca e aguarde o próximo sinal com calma.\n` +
-      `⏱ ${hora()}`
-  }
-
+  const isWin = result.startsWith('win')
+  const msg = `${isWin ? '✅' : '❌'} *${isWin ? 'GREEN CONFIRMADO!' : 'LOSS (STOP LOSS)'}*\n━━━━━━━━━━━━━━━━━━━━\n🤖 Estratégia: *${strategyName}*\n📊 Resultado: *${multiplier.toFixed(2)}x*\n⏱ ${hora()}${formatScore(score)}`
   await sendToTargets(dest, msg, `result_${strategyName}_${Date.now()}`)
-  logger.info(`[WPP] Resultado enviado — ${result} ${multiplier.toFixed(2)}x`)
 }
 
-export async function testConnection(): Promise<{ ok: boolean; error?: string }> {
-  const targets = getSavedTargets()
-  if (state.conn !== 'open') return { ok: false, error: 'WhatsApp não conectado' }
-  if (!targets.length)       return { ok: false, error: 'Nenhum destino selecionado' }
-  try {
-    await sendText(targets[0], `✅ *Teste de conexão*\nAviator Bot online!\n${new Date().toLocaleString('pt-BR')}`)
-    return { ok: true }
-  } catch (e: any) { return { ok: false, error: e.message } }
-}
-
-/** @deprecated use alertWarning + alertConfirmed */
 export async function alertStrategySignal(strategyName: string, signalMsg: string, targets?: string[]): Promise<void> {
   if (state.conn !== 'open') return
   const dest = targets?.length ? targets : getSavedTargets()
   if (!dest.length) return
-  const msg = `🤖 *SINAL*\n📊 ${strategyName}\n📢 ${signalMsg}\n⏱ ${hora()}`
+  const msg = `🤖 *SINAL DE ESTRATÉGIA*\n━━━━━━━━━━━━━━━━━━━━\n📈 Estratégia: *${strategyName}*\n💬 Mensagem: ${signalMsg}\n⏱ ${hora()}`
   await sendToTargets(dest, msg, `signal_${strategyName}`)
+}
+
+export async function testConnection(): Promise<{ ok: boolean; error?: string }> {
+  if (state.conn !== 'open') return { ok: false, error: 'WhatsApp não conectado' }
+  try {
+    const dest = getSavedTargets()
+    if (!dest.length) return { ok: false, error: 'Nenhum destino configurado' }
+    await sendText(dest[0], `🤖 *Teste de Conexão*\n\nSeu bot está online!\n⏱ ${hora()}`)
+    return { ok: true }
+  } catch (err: any) { return { ok: false, error: err.message } }
 }

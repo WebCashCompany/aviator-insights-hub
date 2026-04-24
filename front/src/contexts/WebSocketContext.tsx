@@ -67,8 +67,12 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
    */
   function candleKey(c: Candle): string {
     const rid = (c as any).rodada_id as string | undefined | null
-    if (rid) return `rid_${rid}`
-    return `db_${c.id}`
+    if (rid) {
+      const cleanRid = rid.replace('hist_', '').replace('ws_', '').replace('dom_', '')
+      return `rid_${cleanRid}`
+    }
+    if (c.id) return `db_${c.id}`
+    return `fb_${new Date(c.created_at || 0).getTime()}_${c.multiplicador}`
   }
 
   // Reconstrói array ordenado (mais recente primeiro) a partir do Map interno.

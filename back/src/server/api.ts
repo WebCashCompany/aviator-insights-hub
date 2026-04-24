@@ -224,13 +224,13 @@ router.post('/whatsapp/gale', async (req, res) => {
 })
 
 router.post('/whatsapp/result', async (req, res) => {
-  const { strategyName, result, multiplier, targets } = req.body
+  const { strategyName, result, multiplier, targets, score } = req.body
   if (!strategyName || !result || multiplier === undefined) {
     res.status(400).json({ error: 'strategyName, result e multiplier são obrigatórios' }); return
   }
   if (!isConfigured()) { res.status(503).json({ error: 'WhatsApp não conectado' }); return }
   try {
-    await alertResult(strategyName, result, multiplier, targets)
+    await alertResult(strategyName, result, multiplier, targets, score ?? undefined)
     res.json({ ok: true })
   } catch (err: any) {
     res.status(500).json({ ok: false, error: err.message })
