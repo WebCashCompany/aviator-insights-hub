@@ -59,9 +59,14 @@ export interface ServerStatus {
 }
 
 export interface AIAnalysis {
-  padrao: string
-  estrategiaRecomendada: string
-  confianca: number
-  insights: string[]
   resumo: string
+  padrao: string
+  estrategiaRecomendada: string          // 'ENTRAR' | 'AGUARDAR' | 'ABORTAR'
+  confianca: number                      // 0.0 – 1.0
+  insights: string[]
+  // ── Campos novos retornados pelo Gemini ──────────────────────────────────
+  nivelRisco?:    string                 // 'BAIXO' | 'MÉDIO' | 'ALTO'
+  melhorMomento?: string
+  gestaoGale?:    string
+  alertas?:       (string | null)[]
 }

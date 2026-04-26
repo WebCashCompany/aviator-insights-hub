@@ -39,44 +39,30 @@ export function useWS() {
 
 const WS_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:3001'
 const MAX_CANDLES_IN_MEMORY = 1000
-const RECONNECT_DELAY_MS    = 3_000
+const RECONNECT_DELAY_MS = 3_000
+
+function candleKey(c: Candle): string {
+  const rid = (c as any).rodada_id as string | undefined | null
+  if (rid) {
+    const cleanRid = rid.replace('hist_', '').replace('ws_', '').replace('dom_', '')
+    return `rid_${cleanRid}`
+  }
+  if (c.id) return `db_${c.id}`
+  return `fb_${new Date(c.created_at || 0).getTime()}_${c.multiplicador}`
+}
 
 export function WebSocketProvider({ children }: { children: React.ReactNode }) {
-  // Buffer interno persistente: Map chave → Candle.
-  // Nunca é zerado em reconexão automática — preserva histórico entre drops de conexão.
   const candleMapRef = useRef<Map<string, Candle>>(new Map())
 
-  const [candles, setCandles]     = useState<Candle[]>([])
-  const [status, setStatus]       = useState<ServerStatus>(DEFAULT_STATUS)
+  const [candles, setCandles] = useState<Candle[]>([])
+  const [status, setStatus] = useState<ServerStatus>(DEFAULT_STATUS)
   const [connected, setConnected] = useState(false)
   const [lastCandle, setLastCandle] = useState<Candle | null>(null)
 
-  const wsRef           = useRef<WebSocket | null>(null)
-  const reconnectTimer  = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const isMounted       = useRef(true)
+  const wsRef = useRef<WebSocket | null>(null)
+  const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const isMounted = useRef(true)
 
-  /**
-   * BUG CORRIGIDO: chave unificada.
-   *
-   * Antes, candles sem rodada_id geravam `fallback_<ts>_<id>` aqui, mas
-   * `db_<id>` no HistoryPage — causando duplicatas no merge e velas fantasmas
-   * que "desapareciam" quando o banco respondia.
-   *
-   * Agora: se tem rodada_id → `rid_<rodada_id>` (mesmo para dom_* e ws_*).
-   *        se não tem       → `db_<id>` (consistente com o lado do banco).
-   */
-  function candleKey(c: Candle): string {
-    const rid = (c as any).rodada_id as string | undefined | null
-    if (rid) {
-      const cleanRid = rid.replace('hist_', '').replace('ws_', '').replace('dom_', '')
-      return `rid_${cleanRid}`
-    }
-    if (c.id) return `db_${c.id}`
-    return `fb_${new Date(c.created_at || 0).getTime()}_${c.multiplicador}`
-  }
-
-  // Reconstrói array ordenado (mais recente primeiro) a partir do Map interno.
-  // Sempre cria um novo array — garante que React detecte a mudança de referência.
   function flushMap(): Candle[] {
     const arr = Array.from(candleMapRef.current.values())
       .sort((a, b) => {
@@ -85,7 +71,7 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
         return tb - ta
       })
       .slice(0, MAX_CANDLES_IN_MEMORY)
-    setCandles([...arr])   // spread extra garante nova referência mesmo se conteúdo idêntico
+    setCandles([...arr])
     return arr
   }
 
@@ -116,9 +102,6 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
 
         switch (msg.type) {
           case 'HISTORY': {
-            // Histórico inicial: popula o Map com todas as velas recebidas.
-            // Não limpa o Map — pode ter chegado um NEW_CANDLE antes do HISTORY
-            // em caso de reconexão rápida.
             const history: Candle[] = Array.isArray(msg.data) ? msg.data : []
             let changed = false
             for (const c of history) {
@@ -136,15 +119,13 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
           }
 
           case 'NEW_CANDLE': {
-            // Nova vela em tempo real: insere/atualiza no Map e re-renderiza.
             const candle: Candle = msg.data
             const k = candleKey(candle)
             candleMapRef.current.set(k, candle)
 
-            // Limita tamanho: remove a mais antiga se ultrapassar o limite
             if (candleMapRef.current.size > MAX_CANDLES_IN_MEMORY) {
               let oldestKey: string | null = null
-              let oldestTs  = Infinity
+              let oldestTs = Infinity
               for (const [key, c] of candleMapRef.current) {
                 const ts = new Date(((c as any).timestamp || c.created_at) as string).getTime()
                 if (ts < oldestTs) { oldestTs = ts; oldestKey = key }
@@ -178,7 +159,6 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
       setConnected(false)
       setStatus(prev => ({ ...prev, connected: false }))
       wsRef.current = null
-      // Não limpa o candleMapRef no close — preserva histórico entre reconexões
       reconnectTimer.current = setTimeout(() => {
         if (isMounted.current) connect()
       }, RECONNECT_DELAY_MS)
@@ -205,7 +185,6 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
   }, [connected])
 
   const reconnect = useCallback(() => {
-    // No reconnect manual, limpa o Map para forçar re-sincronização completa
     candleMapRef.current.clear()
     setCandles([])
     setLastCandle(null)

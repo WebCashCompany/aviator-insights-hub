@@ -2,9 +2,9 @@ import { useState, useMemo, useRef, useEffect, useCallback } from 'react'
 import { useWS } from '@/contexts/WebSocketContext'
 import { useCandles } from '@/hooks/useCandles'
 import {
-  ShieldAlert, CheckCircle2,
+  ShieldAlert,
   MessageCircle, Clock, Zap, Trophy,
-  Users, WifiOff, Activity, Settings2, X
+  WifiOff, Activity, Settings2, CheckCircle, AlertTriangle
 } from 'lucide-react'
 import WppModal from '@/components/WppModal'
 import { Candle } from '@/types'
@@ -27,10 +27,7 @@ const NGROK_HEADERS: HeadersInit = API_BASE.includes('ngrok')
 function apiFetch(url: string, options: RequestInit = {}): Promise<Response> {
   return fetch(url, {
     ...options,
-    headers: {
-      ...NGROK_HEADERS,
-      ...(options.headers ?? {}),
-    },
+    headers: { ...NGROK_HEADERS, ...(options.headers ?? {}) },
   })
 }
 
@@ -51,6 +48,10 @@ const candleCor      = (c: Candle): NormalizedColor => normalizeColor(c.cor)
 const isBlueCandle   = (c: Candle): boolean => candleCor(c) === 'blue'
 const isPurpleCandle = (c: Candle): boolean => candleCor(c) === 'purple'
 
+function candleTs(c: Candle): number {
+  return new Date(c.created_at || 0).getTime()
+}
+
 // ─── Tipos ────────────────────────────────────────────────────────────────────
 interface SignalResult { tipo: 'entrar' | 'aguardar' | 'bloqueado' | 'pre_sinal'; msg: string; color: string }
 interface StratStats { wins: number; losses: number; g1: number; g2: number; loss: number; winRate: number; total: number }
@@ -60,23 +61,31 @@ interface StrategyDef {
   detectSignal: (candles: Candle[]) => SignalResult | null
   configFields?: ConfigField[]
 }
-interface WppConfig { enabled: boolean; serverConfigured: boolean; lastSentAt: number | null; targets: string[] }
 
-type TradePhase = 'idle' | 'pre_sinal' | 'warning_sent' | 'confirmed' | 'gale'
-interface TradeState {
-  phase:            TradePhase
-  entryCandles:     number
-  stratName:        string
-  preSignalStreak:  number
-  entryCandleIndex: number
+interface WppConfig {
+  enabled:          boolean
+  serverConfigured: boolean
+  lastSentAt:       number | null
+  targets:          string[]
 }
 
-// ─── Placar da sessão ─────────────────────────────────────────────────────────
+type TradePhase = 'idle' | 'pre_sinal' | 'warning_sent' | 'confirmed' | 'gale'
+
+// FIX: entryTimestamp substitui entryCandleIndex — timestamp é estável,
+// índice de array muda toda vez que o useMemo remonta o array mesclado
+interface TradeState {
+  phase:           TradePhase
+  entryCandles:    number
+  stratName:       string
+  preSignalStreak: number
+  entryTimestamp:  number
+}
+
 interface SessionScore {
-  wins:   number   // total de wins (g1 + g2)
-  winsG1: number   // wins diretos
-  winsG2: number   // wins no martingale
-  losses: number   // losses totais
+  wins:   number
+  winsG1: number
+  winsG2: number
+  losses: number
 }
 
 // ─── Constantes de mercado ────────────────────────────────────────────────────
@@ -84,17 +93,14 @@ const MARKET_PAYING_THRESHOLD = 0.485
 const MARKET_WINDOW           = 60
 const MARKET_ALERT_COOLDOWN   = 10 * 60 * 1000
 
-// ─── Chave de deduplicação ─────────────────────────────────────────────────────
+// ─── Chave de deduplicação ────────────────────────────────────────────────────
 function candleKey(c: any): string {
-  // Se tem rodada_id, usamos ele como chave única (remove prefixos de histórico)
   const rid = c.rodada_id as string | undefined | null
   if (rid) {
     const cleanRid = rid.replace('hist_', '').replace('ws_', '').replace('dom_', '')
     return `rid_${cleanRid}`
   }
-  // Se não tem rodada_id, usamos o ID do banco
   if (c.id) return `db_${c.id}`
-  // Fallback para evitar chaves nulas
   return `fb_${new Date(c.created_at || 0).getTime()}_${c.multiplicador}`
 }
 
@@ -250,53 +256,63 @@ function buildStrategies(config: Record<string, string>): StrategyDef[] {
   ]
 }
 
-const INITIAL_TRADE: TradeState = { phase: 'idle', entryCandles: 0, stratName: '', preSignalStreak: 0, entryCandleIndex: -1 }
+const INITIAL_TRADE: TradeState = {
+  phase: 'idle', entryCandles: 0, stratName: '',
+  preSignalStreak: 0, entryTimestamp: 0,
+}
 const INITIAL_SCORE: SessionScore = { wins: 0, winsG1: 0, winsG2: 0, losses: 0 }
 
 export default function SignalPage() {
   const { candles: wsCandles, lastCandle, status: wsStatus } = useWS()
-  const { candles: dbCandles, loading: dbLoading } = useCandles({ limit: 100 })
+  const { candles: dbCandles } = useCandles({ limit: 100 })
 
   const [limit, setLimit] = useState(100)
   const LIMIT_OPTIONS = [50, 100, 200, 500]
 
+  // candles mesclados — usado para backtest, display e análise de mercado na UI
   const candles = useMemo(() => {
     const map = new Map<string, Candle>()
-    
-    // 1. Adicionamos as do banco (Fonte de Verdade)
-    dbCandles.forEach(c => {
-      const key = candleKey(c)
-      map.set(key, c)
-    })
-    
-    // 2. Adicionamos as do WebSocket apenas se não existirem (Deduplicação Real)
+    dbCandles.forEach(c => { map.set(candleKey(c), c) })
     wsCandles.forEach(c => {
       const key = candleKey(c)
-      if (!map.has(key)) {
-        map.set(key, c)
-      }
+      if (!map.has(key)) map.set(key, c)
     })
-
-    // 3. Filtramos para garantir que não temos "velas fantasmas" sem dados básicos
-    const result = Array.from(map.values())
+    return Array.from(map.values())
       .filter(c => c.multiplicador !== undefined && c.created_at)
-      .sort((a, b) => new Date(a.created_at!).getTime() - new Date(b.created_at!).getTime())
-
-    // 4. O limite agora corta o excesso de forma agressiva
-    return result.slice(-limit)
+      .sort((a, b) => candleTs(a) - candleTs(b))
+      .slice(-limit)
   }, [dbCandles, wsCandles, limit])
 
-  // ─── Persistência ────────────────────────────────────────────────────────────
-  const [selectedId, setSelectedId] = useState<string>(() => localStorage.getItem('aviator_selected_strat') || 's_roxa_azul50')
-  const [botEnabled, setBotEnabled] = useState<boolean>(() => localStorage.getItem('aviator_bot_enabled') === 'true')
-  
+  // FIX PRINCIPAL: wsOnly — apenas velas do WebSocket, ordenadas por tempo
+  // O monitor de estratégia usa ESTE array, não o mesclado.
+  // Motivo: o array mesclado depende de dbCandles (banco) que tem latência de rede/polling.
+  // wsCandles atualiza imediatamente a cada NEW_CANDLE do WebSocket — zero atraso.
+  const wsOnly = useMemo(() => {
+    return [...wsCandles]
+      .filter(c => c.multiplicador !== undefined && c.created_at)
+      .sort((a, b) => candleTs(a) - candleTs(b))
+  }, [wsCandles])
+
+  // ─── Persistência ─────────────────────────────────────────────────────────────
+  const [selectedId, setSelectedId] = useState<string>(
+    () => localStorage.getItem('aviator_selected_strat') || 's_roxa_azul50'
+  )
+  const [botEnabled, setBotEnabled] = useState<boolean>(
+    () => localStorage.getItem('aviator_bot_enabled') === 'true'
+  )
+
   useEffect(() => { localStorage.setItem('aviator_selected_strat', selectedId || '') }, [selectedId])
   useEffect(() => { localStorage.setItem('aviator_bot_enabled', String(botEnabled)) }, [botEnabled])
 
   const [config, setConfig] = useState<Record<string, string>>({})
   const [configLoaded, setConfigLoaded] = useState(false)
 
-  const [wppConfig, setWppConfig] = useState<WppConfig>({ enabled: botEnabled, serverConfigured: false, lastSentAt: null, targets: [] })
+  const [wppConfig, setWppConfig] = useState<WppConfig>({
+    enabled: botEnabled,
+    serverConfigured: false,
+    lastSentAt: null,
+    targets: [],
+  })
   const [showWppModal, setShowWppModal] = useState(false)
 
   const wppConfigRef = useRef(wppConfig)
@@ -307,8 +323,12 @@ export default function SignalPage() {
   }, [])
 
   const tradeRef = useRef<TradeState>(INITIAL_TRADE)
-  const [tradeDisplay, setTradeDisplay] = useState<{ kind: 'idle' | 'pre_sinal' | 'warning' | 'confirmed' | 'gale' | 'result'; result?: 'win_g1' | 'win_g2' | 'loss'; multiplier?: number }>({ kind: 'idle' })
-  
+  const [tradeDisplay, setTradeDisplay] = useState<{
+    kind: 'idle' | 'pre_sinal' | 'warning' | 'confirmed' | 'gale' | 'result'
+    result?: 'win_g1' | 'win_g2' | 'loss'
+    multiplier?: number
+  }>({ kind: 'idle' })
+
   const scoreRef = useRef<SessionScore>(INITIAL_SCORE)
   const [sessionScore, setSessionScore] = useState<SessionScore>(INITIAL_SCORE)
   useEffect(() => {
@@ -316,16 +336,16 @@ export default function SignalPage() {
     return () => clearInterval(timer)
   }, [])
 
-  const prevBlueStreak = useRef(-1)
-  const prevTipoRef = useRef<string | null>(null)
-  const lastTotalCount = useRef(-1)
-  const lastStratCandleCount = useRef(-1)
-  const lastGenCandleCount = useRef(-1)
-  const wasPayingRef = useRef<boolean | null>(null)
-  const lastPayAlertAt = useRef(0)
+  // FIX: refs de controle baseados em timestamp (estável) em vez de índice de array
+  const prevBlueStreak       = useRef(-1)
+  const prevTipoRef          = useRef<string | null>(null)
+  const lastProcessedWsTs    = useRef(0)
+  const lastProcessedMktTs   = useRef(0)
+  const wasPayingRef         = useRef<boolean | null>(null)
+  const lastPayAlertAt       = useRef(0)
 
   const strategies = useMemo(() => buildStrategies(config), [config])
-  const selected = useMemo(() => strategies.find(s => s.id === selectedId), [strategies, selectedId])
+  const selected   = useMemo(() => strategies.find(s => s.id === selectedId), [strategies, selectedId])
 
   useEffect(() => {
     const saved = localStorage.getItem('aviator_strat_configs')
@@ -350,41 +370,56 @@ export default function SignalPage() {
   const sinalAtual: SignalResult | null = allSignals[selectedId ?? ''] ?? null
   const marketPaying = useMemo(() => isMarketPaying(candles), [candles])
 
-  // ── apiPost ───────────────────────────────────────────────────────────────
+  // ── apiPost com log para debug ────────────────────────────────────────────────
   const apiPost = useCallback(async (endpoint: string, body: object, withLink = false) => {
     const cfg = wppConfigRef.current
-    if (!cfg.enabled) return
-    if (!cfg.serverConfigured) return
-    if (!cfg.targets.length) return
-    const payload = { ...body, targets: cfg.targets, ...(withLink ? { gameLink: GAME_LINK } : {}) }
+    console.log(`[WPP] ${endpoint} | enabled=${cfg.enabled} configured=${cfg.serverConfigured} targets=${cfg.targets.length}`)
+    if (!cfg.enabled || !cfg.serverConfigured || !cfg.targets.length) return
+    const payload = {
+      ...body,
+      targets: cfg.targets,
+      ...(withLink ? { gameLink: GAME_LINK } : {}),
+    }
     try {
-      await apiFetch(`${API_BASE}${endpoint}`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+      const res = await apiFetch(`${API_BASE}${endpoint}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
       })
+      const json = await res.json().catch(() => ({}))
+      console.log(`[WPP] ${endpoint} → ${res.status}`, json)
       updateWppConfig({ lastSentAt: Date.now() })
-    } catch (e) { console.error(`[WPP] Falha em ${endpoint}:`, e) }
+    } catch (e) {
+      console.error(`[WPP] Falha em ${endpoint}:`, e)
+    }
   }, [updateWppConfig])
 
   const apiPostMarket = useCallback(async () => {
     const cfg = wppConfigRef.current
     if (!cfg.enabled || !cfg.serverConfigured || !cfg.targets.length) return
     try {
-      await apiFetch(`${API_BASE}/whatsapp/market-paying`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
+      const res = await apiFetch(`${API_BASE}/whatsapp/market-paying`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ targets: cfg.targets, gameLink: GAME_LINK }),
       })
+      console.log('[WPP] market-paying →', res.status)
       updateWppConfig({ lastSentAt: Date.now() })
-    } catch (e) { console.error('[WPP] Falha ao enviar market-paying:', e) }
+    } catch (e) {
+      console.error('[WPP] Falha market-paying:', e)
+    }
   }, [updateWppConfig])
 
-  // ─── Monitor de mercado pagando ───────────────────────────────────────────
+  // ─── Monitor de mercado — usa wsOnly ─────────────────────────────────────────
   useEffect(() => {
     if (!botEnabled) return
-    if (candles.length < MARKET_WINDOW) return
-    const totalNow = candles.length
-    if (totalNow === lastTotalCount.current) return
-    lastTotalCount.current = totalNow
-    const paying = isMarketPaying(candles)
+    if (wsOnly.length < MARKET_WINDOW) return
+    const last = wsOnly[wsOnly.length - 1]
+    const ts   = candleTs(last)
+    if (ts <= lastProcessedMktTs.current) return
+    lastProcessedMktTs.current = ts
+
+    const paying = isMarketPaying(wsOnly)
     if (wasPayingRef.current === null) { wasPayingRef.current = paying; return }
     if (paying && wasPayingRef.current === false) {
       if (Date.now() - lastPayAlertAt.current >= MARKET_ALERT_COOLDOWN) {
@@ -393,209 +428,446 @@ export default function SignalPage() {
       }
     }
     wasPayingRef.current = paying
-  }, [candles, botEnabled, apiPostMarket])
+  }, [wsOnly, botEnabled, apiPostMarket])
 
-  // ─── Monitor de estratégia ────────────────────────────────────────────────
+  // ─── Monitor de estratégia — usa wsOnly para ZERO atraso ─────────────────────
   useEffect(() => {
-    if (!botEnabled) return
-    if (!candles.length || !selected) return
-    const tipo  = sinalAtual?.tipo ?? null
+    if (!botEnabled || !wsOnly.length || !selected) return
+
+    const lastWsCandle = wsOnly[wsOnly.length - 1]
+    const ts = candleTs(lastWsCandle)
+
+    // Ignora se não chegou vela nova
+    if (ts <= lastProcessedWsTs.current) return
+    lastProcessedWsTs.current = ts
+
+    console.log(`[STRAT] Vela: ${lastWsCandle.cor} ${lastWsCandle.multiplicador}x | phase=${tradeRef.current.phase}`)
+
     const trade = tradeRef.current
 
-    function resolveResult(waitingSinceLength: number, phase: 'confirmed' | 'gale', stratName: string): boolean {
-      if (candles.length <= waitingSinceLength) return false
-      const resultCandle = candles[candles.length - 1]
-      const mult = Number(resultCandle.multiplicador)
+    // Resolve resultado usando timestamp: busca primeira vela APÓS o timestamp de entrada
+    function resolveResult(entryTs: number, phase: 'confirmed' | 'gale', stratName: string): boolean {
+      const afterEntry = wsOnly.filter(c => candleTs(c) > entryTs)
+      if (afterEntry.length === 0) return false
+
+      const resultCandle = afterEntry[0]
+      const mult  = Number(resultCandle.multiplicador)
       const isWin = mult >= 2
+      const snap  = { ...scoreRef.current }
+
+      console.log(`[STRAT] Resolve ${phase}: ${resultCandle.cor} ${mult}x → ${isWin ? 'WIN' : 'LOSS'}`)
+
       if (phase === 'confirmed') {
         if (isWin) {
-          scoreRef.current.wins++; scoreRef.current.winsG1++
+          scoreRef.current = { ...snap, wins: snap.wins + 1, winsG1: snap.winsG1 + 1 }
           apiPost('/whatsapp/result', { strategyName: stratName, result: 'win_g1', multiplier: mult, score: { ...scoreRef.current } })
-          tradeRef.current = { ...INITIAL_TRADE }; setTradeDisplay({ kind: 'result', result: 'win_g1', multiplier: mult })
+          tradeRef.current = { ...INITIAL_TRADE }
+          setTradeDisplay({ kind: 'result', result: 'win_g1', multiplier: mult })
           setTimeout(() => setTradeDisplay({ kind: 'idle' }), 6000)
         } else {
           apiPost('/whatsapp/gale', { strategyName: stratName })
-          tradeRef.current = { ...trade, phase: 'gale', entryCandleIndex: candles.length }
+          tradeRef.current = { ...trade, phase: 'gale', entryTimestamp: candleTs(resultCandle) }
           setTradeDisplay({ kind: 'gale' })
         }
       } else {
         const result = isWin ? 'win_g2' : 'loss'
-        if (isWin) { scoreRef.current.wins++; scoreRef.current.winsG2++ } else { scoreRef.current.losses++ }
+        if (isWin) scoreRef.current = { ...snap, wins: snap.wins + 1, winsG2: snap.winsG2 + 1 }
+        else        scoreRef.current = { ...snap, losses: snap.losses + 1 }
         apiPost('/whatsapp/result', { strategyName: stratName, result, multiplier: mult, score: { ...scoreRef.current } })
-        tradeRef.current = { ...INITIAL_TRADE }; setTradeDisplay({ kind: 'result', result, multiplier: mult })
+        tradeRef.current = { ...INITIAL_TRADE }
+        setTradeDisplay({ kind: 'result', result: result as any, multiplier: mult })
         setTimeout(() => setTradeDisplay({ kind: 'idle' }), 6000)
       }
       return true
     }
 
+    // ── Estratégia: Sequência da Vela Roxa ────────────────────────────────────
     if (selected.id === 's_roxa_azul50') {
-      const streak = currentBlueStreak(candles)
-      const paying = isMarketPaying(candles)
-      if (lastStratCandleCount.current === -1) { lastStratCandleCount.current = candles.length; prevBlueStreak.current = streak; return }
-      if (candles.length <= lastStratCandleCount.current) return
-      lastStratCandleCount.current = candles.length
-      const prev = prevBlueStreak.current
+      const streak = currentBlueStreak(wsOnly)
+      const paying = isMarketPaying(wsOnly)
+      const prev   = prevBlueStreak.current
+
+      console.log(`[s_roxa] streak=${streak} prev=${prev} paying=${paying} phase=${trade.phase}`)
+
       if (trade.phase === 'idle') {
+        // Detecta a transição: estava com 1 azul, agora tem 2
         if (paying && streak === 2 && prev === 1) {
+          console.log('[s_roxa] → PRÉ-SINAL')
           apiPost('/whatsapp/warning', { strategyName: selected.name }, true)
-          tradeRef.current = { phase: 'pre_sinal', entryCandles: wsCandles.length, stratName: selected.name, preSignalStreak: streak, entryCandleIndex: -1 }
+          tradeRef.current = {
+            phase: 'pre_sinal', entryCandles: wsOnly.length,
+            stratName: selected.name, preSignalStreak: streak,
+            entryTimestamp: ts,
+          }
           setTradeDisplay({ kind: 'pre_sinal' })
         }
       } else if (trade.phase === 'pre_sinal') {
-        if (tipo === 'entrar') {
+        const tipoAgora = selected.detectSignal(wsOnly)?.tipo
+        if (tipoAgora === 'entrar') {
+          console.log('[s_roxa] → CONFIRMADO')
           apiPost('/whatsapp/confirmed', { strategyName: selected.name }, true)
-          tradeRef.current = { ...trade, phase: 'confirmed', entryCandleIndex: candles.length }
+          tradeRef.current = { ...trade, phase: 'confirmed', entryTimestamp: ts }
           setTradeDisplay({ kind: 'confirmed' })
         } else if (!paying || streak === 0 || streak >= 3) {
-          tradeRef.current = { ...INITIAL_TRADE }; setTradeDisplay({ kind: 'idle' })
+          console.log('[s_roxa] → Pré-sinal cancelado')
+          tradeRef.current = { ...INITIAL_TRADE }
+          setTradeDisplay({ kind: 'idle' })
         }
-      } else if (trade.phase === 'confirmed') { resolveResult(trade.entryCandleIndex, 'confirmed', trade.stratName) }
-      else if (trade.phase === 'gale') { resolveResult(trade.entryCandleIndex, 'gale', trade.stratName) }
+      } else if (trade.phase === 'confirmed') {
+        resolveResult(trade.entryTimestamp, 'confirmed', trade.stratName)
+      } else if (trade.phase === 'gale') {
+        resolveResult(trade.entryTimestamp, 'gale', trade.stratName)
+      }
+
       prevBlueStreak.current = streak
+
+    // ── Estratégias genéricas ─────────────────────────────────────────────────
     } else {
-      const paying = isMarketPaying(candles)
-      if (lastGenCandleCount.current === -1) { lastGenCandleCount.current = candles.length; prevTipoRef.current = tipo; return }
-      if (candles.length <= lastGenCandleCount.current) return
-      lastGenCandleCount.current = candles.length
-      if (!paying) { if (trade.phase !== 'idle') { tradeRef.current = { ...INITIAL_TRADE }; setTradeDisplay({ kind: 'idle' }) }; prevTipoRef.current = tipo; return }
+      const paying    = isMarketPaying(wsOnly)
+      const tipoAgora = selected.detectSignal(wsOnly)?.tipo ?? null
+
+      console.log(`[genérica] tipo=${tipoAgora} prev=${prevTipoRef.current} paying=${paying} phase=${trade.phase}`)
+
+      if (!paying) {
+        if (trade.phase !== 'idle') { tradeRef.current = { ...INITIAL_TRADE }; setTradeDisplay({ kind: 'idle' }) }
+        prevTipoRef.current = tipoAgora; return
+      }
+
       if (trade.phase === 'idle') {
-        if (prevTipoRef.current !== 'entrar' && tipo === 'entrar') {
+        if (prevTipoRef.current !== 'entrar' && tipoAgora === 'entrar') {
+          console.log('[genérica] → WARNING')
           apiPost('/whatsapp/warning', { strategyName: selected.name }, true)
-          tradeRef.current = { phase: 'warning_sent', entryCandles: wsCandles.length, stratName: selected.name, preSignalStreak: 0, entryCandleIndex: -1 }
+          tradeRef.current = {
+            phase: 'warning_sent', entryCandles: wsOnly.length,
+            stratName: selected.name, preSignalStreak: 0,
+            entryTimestamp: ts,
+          }
           setTradeDisplay({ kind: 'warning' })
         }
       } else if (trade.phase === 'warning_sent') {
-        if (wsCandles.length > trade.entryCandles) {
+        if (ts > trade.entryTimestamp) {
+          console.log('[genérica] → CONFIRMADO')
           apiPost('/whatsapp/confirmed', { strategyName: selected.name }, true)
-          tradeRef.current = { ...trade, phase: 'confirmed', entryCandleIndex: candles.length }
+          tradeRef.current = { ...trade, phase: 'confirmed', entryTimestamp: ts }
           setTradeDisplay({ kind: 'confirmed' })
         }
-      } else if (trade.phase === 'confirmed') { resolveResult(trade.entryCandleIndex, 'confirmed', trade.stratName) }
-      else if (trade.phase === 'gale') { resolveResult(trade.entryCandleIndex, 'gale', trade.stratName) }
-      prevTipoRef.current = tipo
+      } else if (trade.phase === 'confirmed') {
+        resolveResult(trade.entryTimestamp, 'confirmed', trade.stratName)
+      } else if (trade.phase === 'gale') {
+        resolveResult(trade.entryTimestamp, 'gale', trade.stratName)
+      }
+
+      prevTipoRef.current = tipoAgora
     }
-  }, [candles, wsCandles, sinalAtual, selected, botEnabled, apiPost])
+  }, [wsOnly, selected, botEnabled, apiPost])
 
+  // ─── Reset ao trocar estratégia ou bot ───────────────────────────────────────
   useEffect(() => {
-    tradeRef.current = { ...INITIAL_TRADE }; scoreRef.current = { ...INITIAL_SCORE }
-    prevBlueStreak.current = -1; prevTipoRef.current = null; lastTotalCount.current = -1
-    lastStratCandleCount.current = -1; lastGenCandleCount.current = -1; wasPayingRef.current = null
+    tradeRef.current           = { ...INITIAL_TRADE }
+    scoreRef.current           = { ...INITIAL_SCORE }
+    prevBlueStreak.current     = -1
+    prevTipoRef.current        = null
+    lastProcessedWsTs.current  = 0
+    lastProcessedMktTs.current = 0
+    wasPayingRef.current       = null
+    lastPayAlertAt.current     = 0
     setTradeDisplay({ kind: 'idle' })
-  }, [selectedId])
+    setSessionScore({ ...INITIAL_SCORE })
+  }, [selectedId, botEnabled])
 
+  // ─── Sync de status WPP ───────────────────────────────────────────────────────
   useEffect(() => {
     const sync = async () => {
       try {
         const res = await apiFetch(`${API_BASE}/whatsapp/status`)
         if (res.ok) {
           const d = await res.json()
-          updateWppConfig({ serverConfigured: !!d.configured, targets: d.targets || [] })
+          const targets: string[] = (d.targets ?? []).filter((t: any) => typeof t === 'string')
+          console.log('[WPP] status sync: configured=', d.configured, 'targets=', targets.length)
+          updateWppConfig({ serverConfigured: !!d.configured, targets })
         }
       } catch {}
     }
-    sync(); const t = setInterval(sync, 5000); return () => clearInterval(t)
+    sync()
+    const t = setInterval(sync, 5000)
+    return () => clearInterval(t)
   }, [updateWppConfig])
 
-  const handleSaveTargets = async (targets: string[]) => {
-    const res = await apiFetch(`${API_BASE}/whatsapp/targets`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ targets }),
-    })
-    if (res.ok) { updateWppConfig({ targets }); setShowWppModal(false) }
-    else throw new Error('Erro ao salvar')
-  }
+  // ─── Callback do WppModal — só atualiza estado local, sem POST duplo ──────────
+  const handleTargetsChange = useCallback((targetIds: string[]) => {
+    console.log('[WPP] Targets atualizados:', targetIds)
+    updateWppConfig({ targets: targetIds })
+    setShowWppModal(false)
+  }, [updateWppConfig])
 
-  if (!configLoaded) return <div className="flex items-center justify-center py-20"><div className="h-6 w-6 rounded-full border-2 border-white/20 border-t-white/60 animate-spin" /></div>
+  if (!configLoaded) return (
+    <div className="flex items-center justify-center py-20">
+      <div className="h-6 w-6 rounded-full border-2 border-white/20 border-t-white/60 animate-spin" />
+    </div>
+  )
+
+  const stats          = allStats[selectedId]
+  const totalOps       = sessionScore.wins + sessionScore.losses
+  const sessionWinRate = totalOps > 0 ? ((sessionScore.wins / totalOps) * 100).toFixed(1) : null
 
   return (
     <div className="space-y-5 pb-20 lg:pb-0 relative">
+
+      {/* Limite de velas */}
       <div className="flex items-center justify-between gap-3 flex-wrap">
         <h2 className="text-xl font-bold text-foreground">Estratégias</h2>
         <div className="flex rounded-lg overflow-hidden border border-white/10">
           {LIMIT_OPTIONS.map(l => (
-            <button key={l} onClick={() => setLimit(l)} className="px-2.5 py-1 text-[11px] font-medium transition-colors"
-              style={{ background: limit === l ? 'rgba(127,119,221,0.3)' : 'transparent', color: limit === l ? 'rgba(255,255,255,0.9)' : 'rgba(255,255,255,0.4)' }}>
+            <button
+              key={l}
+              onClick={() => setLimit(l)}
+              className="px-2.5 py-1 text-[11px] font-medium transition-colors"
+              style={{
+                background: limit === l ? 'rgba(127,119,221,0.3)' : 'transparent',
+                color:      limit === l ? 'rgba(255,255,255,0.9)' : 'rgba(255,255,255,0.4)',
+              }}
+            >
               {l}
             </button>
           ))}
         </div>
       </div>
 
+      {/* Cards de status */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+
+        {/* Status Bot */}
         <div className="bg-zinc-900/50 border border-white/5 p-4 rounded-2xl">
           <div className="flex items-center gap-3 mb-4">
             <div className="p-2 bg-purple-500/10 rounded-lg"><Activity className="h-5 w-5 text-purple-400" /></div>
-            <div><h3 className="text-sm font-medium text-zinc-400">Status do Bot</h3><p className="text-lg font-semibold text-white">{wsStatus.connected ? 'Capturando' : 'Desconectado'}</p></div>
+            <div>
+              <h3 className="text-sm font-medium text-zinc-400">Status do Bot</h3>
+              <p className="text-lg font-semibold text-white">{wsStatus.connected ? 'Capturando' : 'Desconectado'}</p>
+            </div>
           </div>
-          <div className="flex items-center gap-2"><div className={`h-2 w-2 rounded-full ${wsStatus.connected ? 'bg-green-500 animate-pulse' : 'bg-red-500'}`} /><span className="text-xs text-zinc-500">Live: {candles.length} velas em memória</span></div>
+          <div className="flex items-center gap-2">
+            <div className={`h-2 w-2 rounded-full ${wsStatus.connected ? 'bg-green-500 animate-pulse' : 'bg-red-500'}`} />
+            <span className="text-xs text-zinc-500">
+              Total: {candles.length} · WS live: {wsOnly.length}
+            </span>
+          </div>
         </div>
+
+        {/* Placar */}
         <div className="bg-zinc-900/50 border border-white/5 p-4 rounded-2xl">
-          <div className="flex items-center gap-3 mb-4">
+          <div className="flex items-center gap-3 mb-3">
             <div className="p-2 bg-green-500/10 rounded-lg"><Trophy className="h-5 w-5 text-green-400" /></div>
-            <div><h3 className="text-sm font-medium text-zinc-400">Placar da Sessão</h3><p className="text-lg font-semibold text-white">{sessionScore.wins}W - {sessionScore.losses}L</p></div>
+            <div>
+              <h3 className="text-sm font-medium text-zinc-400">Placar da Sessão</h3>
+              <p className="text-lg font-semibold text-white">{sessionScore.wins}W — {sessionScore.losses}L</p>
+            </div>
           </div>
-          <div className="flex gap-4 text-xs text-zinc-500"><span>G1: <b className="text-green-400">{sessionScore.winsG1}</b></span><span>G2: <b className="text-green-400">{sessionScore.winsG2}</b></span></div>
+          <div className="flex gap-4 text-xs text-zinc-500">
+            <span>G1: <b className="text-green-400">{sessionScore.winsG1}</b></span>
+            <span>G2: <b className="text-green-400">{sessionScore.winsG2}</b></span>
+            {sessionWinRate && (
+              <span>
+                Taxa: <b className={parseFloat(sessionWinRate) >= 60 ? 'text-green-400' : 'text-red-400'}>
+                  {sessionWinRate}%
+                </b>
+              </span>
+            )}
+          </div>
         </div>
+
+        {/* WhatsApp */}
         <div className="bg-zinc-900/50 border border-white/5 p-4 rounded-2xl">
-          <div className="flex items-center justify-between mb-4">
+          <div className="flex items-center justify-between mb-3">
             <div className="flex items-center gap-3">
               <div className="p-2 bg-amber-500/10 rounded-lg"><MessageCircle className="h-5 w-5 text-amber-400" /></div>
-              <div><h3 className="text-sm font-medium text-zinc-400">WhatsApp</h3><p className="text-lg font-semibold text-white">{wppConfig.serverConfigured ? 'Conectado' : 'Desconectado'}</p></div>
+              <div>
+                <h3 className="text-sm font-medium text-zinc-400">WhatsApp</h3>
+                <p className="text-lg font-semibold text-white">
+                  {wppConfig.serverConfigured
+                    ? wppConfig.targets.length > 0
+                      ? `${wppConfig.targets.length} grupo${wppConfig.targets.length !== 1 ? 's' : ''}`
+                      : 'Sem grupos'
+                    : 'Desconectado'}
+                </p>
+              </div>
             </div>
-            <button onClick={() => setShowWppModal(true)} className="p-2 hover:bg-white/10 rounded-lg transition-colors bg-white/5"><Settings2 className="h-5 w-5 text-zinc-400" /></button>
+            <button
+              onClick={() => setShowWppModal(true)}
+              className="p-2 hover:bg-white/10 rounded-lg transition-colors bg-white/5"
+            >
+              <Settings2 className="h-5 w-5 text-zinc-400" />
+            </button>
           </div>
-          <button onClick={() => setBotEnabled(!botEnabled)} className={`w-full py-2 rounded-xl text-xs font-bold transition-all ${botEnabled ? 'bg-red-500/10 text-red-400 border border-red-500/20' : 'bg-green-500/10 text-green-400 border border-green-500/20'}`}>{botEnabled ? 'DESATIVAR ROBÔ' : 'ATIVAR ROBÔ'}</button>
+          <button
+            onClick={() => setBotEnabled(!botEnabled)}
+            className={`w-full py-2 rounded-xl text-xs font-bold transition-all ${
+              botEnabled
+                ? 'bg-red-500/10 text-red-400 border border-red-500/20'
+                : 'bg-green-500/10 text-green-400 border border-green-500/20'
+            }`}
+          >
+            {botEnabled ? 'DESATIVAR ROBÔ' : 'ATIVAR ROBÔ'}
+          </button>
         </div>
       </div>
 
+      {/* Banner de trade ativo */}
+      {tradeDisplay.kind !== 'idle' && (
+        <div
+          className="rounded-2xl p-4 border flex items-center gap-4 transition-all"
+          style={{
+            backgroundColor:
+              tradeDisplay.kind === 'result' && tradeDisplay.result === 'loss' ? 'rgba(239,68,68,0.08)'
+              : tradeDisplay.kind === 'result'    ? 'rgba(34,197,94,0.08)'
+              : tradeDisplay.kind === 'confirmed' ? 'rgba(34,197,94,0.08)'
+              : tradeDisplay.kind === 'gale'      ? 'rgba(251,146,60,0.08)'
+              : 'rgba(251,191,36,0.08)',
+            borderColor:
+              tradeDisplay.kind === 'result' && tradeDisplay.result === 'loss' ? 'rgba(239,68,68,0.3)'
+              : tradeDisplay.kind === 'result'    ? 'rgba(34,197,94,0.3)'
+              : tradeDisplay.kind === 'confirmed' ? 'rgba(34,197,94,0.3)'
+              : tradeDisplay.kind === 'gale'      ? 'rgba(251,146,60,0.3)'
+              : 'rgba(251,191,36,0.3)',
+          }}
+        >
+          <div className="flex-shrink-0">
+            {tradeDisplay.kind === 'pre_sinal'  && <AlertTriangle className="h-6 w-6 text-yellow-400" />}
+            {tradeDisplay.kind === 'warning'    && <AlertTriangle className="h-6 w-6 text-yellow-400" />}
+            {tradeDisplay.kind === 'confirmed'  && <Zap className="h-6 w-6 text-green-400 fill-current" />}
+            {tradeDisplay.kind === 'gale'       && <AlertTriangle className="h-6 w-6 text-orange-400" />}
+            {tradeDisplay.kind === 'result' && tradeDisplay.result !== 'loss' && <CheckCircle className="h-6 w-6 text-green-400" />}
+            {tradeDisplay.kind === 'result' && tradeDisplay.result === 'loss' && <WifiOff className="h-6 w-6 text-red-400" />}
+          </div>
+          <div className="flex-1">
+            {tradeDisplay.kind === 'pre_sinal'  && <p className="font-bold text-yellow-300">⚠️ PRÉ-SINAL ENVIADO — aguardando roxa</p>}
+            {tradeDisplay.kind === 'warning'    && <p className="font-bold text-yellow-300">⚠️ AVISO ENVIADO — aguardando confirmação</p>}
+            {tradeDisplay.kind === 'confirmed'  && <p className="font-bold text-green-300">🚀 SINAL CONFIRMADO — entre agora!</p>}
+            {tradeDisplay.kind === 'gale'       && <p className="font-bold text-orange-300">🔄 GALE ativado — aguardando resultado</p>}
+            {tradeDisplay.kind === 'result' && tradeDisplay.result === 'win_g1' && (
+              <div>
+                <p className="font-bold text-green-300">✅ WIN G1 — {tradeDisplay.multiplier}x</p>
+                <p className="text-xs text-zinc-400 mt-0.5">
+                  Placar: {scoreRef.current.wins}W / {scoreRef.current.losses}L
+                  &nbsp;·&nbsp; G1: {scoreRef.current.winsG1} · G2: {scoreRef.current.winsG2}
+                </p>
+              </div>
+            )}
+            {tradeDisplay.kind === 'result' && tradeDisplay.result === 'win_g2' && (
+              <div>
+                <p className="font-bold text-green-300">✅ WIN G2 (Gale) — {tradeDisplay.multiplier}x</p>
+                <p className="text-xs text-zinc-400 mt-0.5">
+                  Placar: {scoreRef.current.wins}W / {scoreRef.current.losses}L
+                  &nbsp;·&nbsp; G1: {scoreRef.current.winsG1} · G2: {scoreRef.current.winsG2}
+                </p>
+              </div>
+            )}
+            {tradeDisplay.kind === 'result' && tradeDisplay.result === 'loss' && (
+              <div>
+                <p className="font-bold text-red-300">❌ LOSS — {tradeDisplay.multiplier}x</p>
+                <p className="text-xs text-zinc-400 mt-0.5">
+                  Placar: {scoreRef.current.wins}W / {scoreRef.current.losses}L
+                  &nbsp;·&nbsp; G1: {scoreRef.current.winsG1} · G2: {scoreRef.current.winsG2}
+                </p>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Estratégia */}
       <div className="bg-zinc-900/50 border border-white/5 rounded-3xl overflow-hidden">
         <div className="p-6 border-b border-white/5 flex flex-col md:flex-row md:items-center justify-between gap-4">
           <div className="flex items-center gap-4">
             <div className="p-3 bg-purple-500/10 rounded-2xl">{selected?.icon}</div>
-            <div><h2 className="text-xl font-bold text-white">{selected?.name}</h2><p className="text-sm text-zinc-400">{selected?.description}</p></div>
+            <div>
+              <h2 className="text-xl font-bold text-white">{selected?.name}</h2>
+              <p className="text-sm text-zinc-400">{selected?.description}</p>
+            </div>
           </div>
-          <select value={selectedId} onChange={(e) => setSelectedId(e.target.value)} className="bg-zinc-800 border border-white/10 rounded-xl px-4 py-2 text-sm text-white focus:outline-none focus:ring-2 focus:ring-purple-500">
+          <select
+            value={selectedId}
+            onChange={(e) => setSelectedId(e.target.value)}
+            className="bg-zinc-800 border border-white/10 rounded-xl px-4 py-2 text-sm text-white focus:outline-none focus:ring-2 focus:ring-purple-500"
+          >
             {strategies.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
           </select>
         </div>
+
         <div className="p-6 grid grid-cols-1 lg:grid-cols-2 gap-8">
+          {/* Sinal + mercado */}
           <div className="space-y-6">
             <div className="bg-black/20 rounded-2xl p-6 border border-white/5">
               <h3 className="text-xs font-bold text-zinc-500 mb-4 uppercase tracking-widest">Sinal Atual</h3>
               {sinalAtual ? (
                 <div className="space-y-4">
-                  <div className="text-2xl font-bold p-5 rounded-2xl border flex items-center gap-4 transition-all" style={{ backgroundColor: `${sinalAtual.color}10`, borderColor: `${sinalAtual.color}30`, color: sinalAtual.color }}>
-                    {sinalAtual.tipo === 'entrar' && <Zap className="h-7 w-7 fill-current" />}
-                    {sinalAtual.tipo === 'aguardar' && <Clock className="h-7 w-7" />}
-                    {sinalAtual.tipo === 'bloqueado' && <ShieldAlert className="h-7 w-7" />}
-                    {sinalAtual.tipo === 'pre_sinal' && <Activity className="h-7 w-7" />}
-                    {sinalAtual.msg}
+                  <div
+                    className="text-lg font-bold p-5 rounded-2xl border flex items-center gap-4 transition-all"
+                    style={{ backgroundColor: `${sinalAtual.color}10`, borderColor: `${sinalAtual.color}30`, color: sinalAtual.color }}
+                  >
+                    {sinalAtual.tipo === 'entrar'    && <Zap className="h-6 w-6 fill-current flex-shrink-0" />}
+                    {sinalAtual.tipo === 'aguardar'  && <Clock className="h-6 w-6 flex-shrink-0" />}
+                    {sinalAtual.tipo === 'bloqueado' && <ShieldAlert className="h-6 w-6 flex-shrink-0" />}
+                    {sinalAtual.tipo === 'pre_sinal' && <Activity className="h-6 w-6 flex-shrink-0" />}
+                    <span>{sinalAtual.msg}</span>
                   </div>
-                  <div className="flex justify-between text-[10px] text-zinc-500 uppercase font-bold"><span>Última Vela: {lastCandle?.multiplicador}x</span><span>Atualizado: {new Date().toLocaleTimeString()}</span></div>
+                  <div className="flex justify-between text-[10px] text-zinc-500 uppercase font-bold">
+                    <span>Última Vela: {lastCandle?.multiplicador}x</span>
+                    <span>Atualizado: {new Date().toLocaleTimeString()}</span>
+                  </div>
                 </div>
-              ) : <div className="text-zinc-500 italic">Aguardando...</div>}
+              ) : (
+                <div className="text-zinc-500 italic">Aguardando...</div>
+              )}
             </div>
+
             <div className="bg-black/20 rounded-2xl p-6 border border-white/5">
               <h3 className="text-xs font-bold text-zinc-500 mb-4 uppercase tracking-widest">Análise de Mercado</h3>
               <div className="space-y-4">
-                <div className="flex justify-between text-sm"><span className="text-zinc-400">Taxa de Azuis (60 velas)</span><span className={`font-mono font-bold ${isMarketPaying(candles) ? 'text-green-400' : 'text-red-400'}`}>{(bluePercent(candles) * 100).toFixed(1)}%</span></div>
-                <div className="w-full bg-zinc-800 h-2 rounded-full overflow-hidden"><div className={`h-full transition-all duration-1000 ${isMarketPaying(candles) ? 'bg-green-500' : 'bg-red-500'}`} style={{ width: `${bluePercent(candles) * 100}%` }} /></div>
-                <p className="text-[11px] text-zinc-500 leading-relaxed">{isMarketPaying(candles) ? '✅ Mercado favorável para operações.' : '⚠️ Mercado desfavorável. Sinais bloqueados.'}</p>
+                <div className="flex justify-between text-sm">
+                  <span className="text-zinc-400">Taxa de Azuis (60 velas)</span>
+                  <span className={`font-mono font-bold ${marketPaying ? 'text-green-400' : 'text-red-400'}`}>
+                    {(bluePercent(candles) * 100).toFixed(1)}%
+                  </span>
+                </div>
+                <div className="w-full bg-zinc-800 h-2 rounded-full overflow-hidden">
+                  <div
+                    className={`h-full transition-all duration-1000 ${marketPaying ? 'bg-green-500' : 'bg-red-500'}`}
+                    style={{ width: `${bluePercent(candles) * 100}%` }}
+                  />
+                </div>
+                <p className="text-[11px] text-zinc-500 leading-relaxed">
+                  {marketPaying ? '✅ Mercado favorável para operações.' : '⚠️ Mercado desfavorável. Sinais bloqueados.'}
+                </p>
               </div>
             </div>
           </div>
+
+          {/* Performance backtest */}
           <div className="bg-black/20 rounded-2xl p-6 border border-white/5">
             <h3 className="text-xs font-bold text-zinc-500 mb-6 uppercase tracking-widest">Performance (Backtest)</h3>
             <div className="grid grid-cols-2 gap-4 mb-8">
-              <div className="p-5 bg-zinc-900/50 rounded-2xl border border-white/5"><div className="text-3xl font-bold text-white">{allStats[selectedId]?.winRate.toFixed(1)}%</div><div className="text-[10px] text-zinc-500 uppercase font-bold mt-1">Assertividade</div></div>
-              <div className="p-5 bg-zinc-900/50 rounded-2xl border border-white/5"><div className="text-3xl font-bold text-white">{allStats[selectedId]?.total}</div><div className="text-[10px] text-zinc-500 uppercase font-bold mt-1">Sinais</div></div>
+              <div className="p-5 bg-zinc-900/50 rounded-2xl border border-white/5">
+                <div className="text-3xl font-bold text-white">{stats?.winRate.toFixed(1) ?? '—'}%</div>
+                <div className="text-[10px] text-zinc-500 uppercase font-bold mt-1">Assertividade</div>
+              </div>
+              <div className="p-5 bg-zinc-900/50 rounded-2xl border border-white/5">
+                <div className="text-3xl font-bold text-white">{stats?.total ?? '—'}</div>
+                <div className="text-[10px] text-zinc-500 uppercase font-bold mt-1">Sinais</div>
+              </div>
             </div>
             <div className="space-y-3">
               {[
-                { label: 'Wins Diretos (G0)', val: allStats[selectedId]?.g1, color: 'bg-green-500' },
-                { label: 'Wins Martingale (G1)', val: allStats[selectedId]?.g2, color: 'bg-green-400' },
-                { label: 'Losses', val: allStats[selectedId]?.loss, color: 'bg-red-500' }
+                { label: 'Wins Diretos (G0)', val: stats?.g1, color: 'bg-green-500' },
+                { label: 'Wins Martingale (G1)', val: stats?.g2, color: 'bg-green-400' },
+                { label: 'Losses', val: stats?.loss, color: 'bg-red-500' },
               ].map(item => (
-                <div key={item.label} className="flex items-center justify-between p-3 bg-white/5 rounded-xl"><div className="flex items-center gap-3"><div className={`h-2 w-2 rounded-full ${item.color}`} /><span className="text-xs text-zinc-300">{item.label}</span></div><span className="font-mono font-bold text-white">{item.val}</span></div>
+                <div key={item.label} className="flex items-center justify-between p-3 bg-white/5 rounded-xl">
+                  <div className="flex items-center gap-3">
+                    <div className={`h-2 w-2 rounded-full ${item.color}`} />
+                    <span className="text-xs text-zinc-300">{item.label}</span>
+                  </div>
+                  <span className="font-mono font-bold text-white">{item.val ?? '—'}</span>
+                </div>
               ))}
             </div>
           </div>
@@ -603,12 +875,11 @@ export default function SignalPage() {
       </div>
 
       {showWppModal && (
-        <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/80 backdrop-blur-sm p-4 overflow-hidden">
-          <div className="relative w-full max-w-2xl bg-zinc-900 border border-white/10 rounded-3xl shadow-2xl overflow-hidden flex flex-col max-h-[90vh]">
-            <div className="flex items-center justify-between p-6 border-b border-white/5"><h3 className="text-lg font-bold text-white">Configurações do WhatsApp</h3><button onClick={() => setShowWppModal(false)} className="p-2 bg-white/5 hover:bg-white/10 rounded-full text-zinc-400 hover:text-white transition-all"><X className="h-5 w-5" /></button></div>
-            <div className="flex-1 overflow-y-auto p-2"><WppModal isOpen={true} onClose={() => setShowWppModal(false)} initialTargets={wppConfig.targets} onSave={handleSaveTargets} /></div>
-          </div>
-        </div>
+        <WppModal
+          onClose={() => setShowWppModal(false)}
+          initialTargets={wppConfig.targets}
+          onTargetsChange={handleTargetsChange}
+        />
       )}
     </div>
   )

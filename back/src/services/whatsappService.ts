@@ -1,10 +1,13 @@
 /**
  * whatsappService.ts — Baileys + sessão persistida no Supabase
  *
- * CORREÇÕES:
- *  - Reduzido cooldown de alerta de mercado para permitir maior reatividade.
- *  - Envio em paralelo para múltiplos grupos (reduz atraso de rede).
- *  - Ajuste no anti-spam para ser menos restritivo em sinais sequenciais.
+ * CORREÇÕES (alinhadas com SignalPage.tsx):
+ *  - GAME_LINK definido como constante (estava indefinido — causava erro em alertConfirmed)
+ *  - alertWarning / alertConfirmed / alertMarketPaying aceitam gameLink opcional do body do request
+ *  - alertResult diferencia win_g1 / win_g2 / loss na mensagem (antes tratava tudo como "win")
+ *  - Mensagem de alertWarning reflete contexto de pré-sinal (2 azuis detectadas)
+ *  - Spam key de result usa timestamp para nunca bloquear resultados distintos
+ *  - Envio em paralelo mantido para múltiplos grupos
  */
 
 import {
@@ -22,8 +25,13 @@ import { EventEmitter } from 'events'
 import { useSupabaseAuthState } from './supabaseAuthState.js'
 
 // ─── Config ───────────────────────────────────────────────────────────────────
-const MIN_INTERVAL       = parseInt(process.env.WPP_MIN_INTERVAL_MS || '1500') // Reduzido para 1.5s
-const PAY_ALERT_COOLDOWN = 5 * 60 * 1000 // Reduzido para 5 min
+const MIN_INTERVAL       = parseInt(process.env.WPP_MIN_INTERVAL_MS || '1500')
+const PAY_ALERT_COOLDOWN = 5 * 60 * 1000
+
+// FIX: GAME_LINK estava indefinido no serviço — era referenciado em alertConfirmed mas
+// nunca declarado, causando "GAME_LINK is not defined" em runtime.
+// O valor padrão abaixo é usado quando o frontend não envia o gameLink no body.
+const GAME_LINK_DEFAULT = process.env.GAME_LINK || 'https://d3c6klm.com/game/action/6770'
 
 const silentChild: any = {
   level: 'silent', trace: () => {}, debug: () => {}, info: () => {},
@@ -33,9 +41,10 @@ const silentChild: any = {
 // ─── Tipos ────────────────────────────────────────────────────────────────────
 export type ConnState = 'close' | 'connecting' | 'open' | 'error'
 
+// FIX: SessionScore alinhado com o type do SignalPage (winsG1 / winsG2)
 export interface SessionScore {
   wins:   number   // total de wins (winsG1 + winsG2)
-  winsG1: number   // wins diretos (primeira entrada)
+  winsG1: number   // wins diretos (primeira entrada / G0)
   winsG2: number   // wins no martingale (G1)
   losses: number   // losses totais
 }
@@ -65,11 +74,11 @@ export const wppEvents = new EventEmitter()
 
 // ─── Anti-spam ────────────────────────────────────────────────────────────────
 const lastSentAt = new Map<string, number>()
-function canSend(key: string): boolean { 
+function canSend(key: string): boolean {
   const last = lastSentAt.get(key) ?? 0
-  return Date.now() - last >= MIN_INTERVAL 
+  return Date.now() - last >= MIN_INTERVAL
 }
-function markSent(key: string): void   { lastSentAt.set(key, Date.now()) }
+function markSent(key: string): void { lastSentAt.set(key, Date.now()) }
 
 // ─── Helpers públicos ─────────────────────────────────────────────────────────
 export function getConnState():               ConnState            { return state.conn }
@@ -177,8 +186,8 @@ async function sendToTargets(targets: string[], message: string, spamKey: string
   if (!targets.length) return
   if (!canSend(spamKey)) { logger.info(`[WPP] Anti-spam: ${spamKey}`); return }
   markSent(spamKey)
-  
-  // Envio em paralelo para reduzir atraso
+
+  // Envio em paralelo para reduzir atraso de rede
   const promises = targets.map(async (jid) => {
     try { await sendText(jid, message); logger.info(`[WPP] ✅ → ${jid}`) }
     catch (e: any) { logger.error(`[WPP] ❌ → ${jid}: ${e.message}`) }
@@ -188,9 +197,10 @@ async function sendToTargets(targets: string[], message: string, spamKey: string
 
 function hora(): string { return new Date().toLocaleTimeString('pt-BR') }
 
+// FIX: formatScore usa SessionScore com winsG1 / winsG2 (alinhado com SignalPage)
 function formatScore(score?: SessionScore): string {
   if (!score) return ''
-  const total = score.wins + score.losses
+  const total   = score.wins + score.losses
   const winRate = total > 0 ? ((score.wins / total) * 100).toFixed(0) : '0'
   return (
     `\n━━━━━━━━━━━━━━━━━━━━\n` +
@@ -203,30 +213,61 @@ function formatScore(score?: SessionScore): string {
 
 // ─── Alertas ──────────────────────────────────────────────────────────────────
 
-export async function alertMarketPaying(targets?: string[]): Promise<void> {
+// FIX: aceita gameLink do body do request (o frontend envia { targets, gameLink })
+export async function alertMarketPaying(targets?: string[], gameLink?: string): Promise<void> {
   if (state.conn !== 'open') return
   const dest = targets?.length ? targets : getSavedTargets()
   if (!dest.length) return
   if (Date.now() - state.lastPayAlertAt < PAY_ALERT_COOLDOWN) return
   state.lastPayAlertAt = Date.now()
 
-  const msg = `🟢 *GRÁFICO EM MOMENTO FAVORÁVEL*\n━━━━━━━━━━━━━━━━━━━━\n✅ Padrão de entrada identificado\n📊 Volatilidade elevada — bom para operar\n🎯 Fique atento aos próximos sinais!\n⏱ ${hora()}`
+  const link = gameLink || GAME_LINK_DEFAULT
+  const msg =
+    `🟢 *GRÁFICO EM MOMENTO FAVORÁVEL*\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `✅ Padrão de entrada identificado\n` +
+    `📊 Volatilidade elevada — bom para operar\n` +
+    `🎯 Fique atento aos próximos sinais!\n` +
+    `⏱ ${hora()}\n\n` +
+    `🔗 [Clique aqui para abrir o jogo](${link})`
   await sendToTargets(dest, msg, 'market_paying')
 }
 
-export async function alertWarning(strategyName: string, targets?: string[]): Promise<void> {
+// FIX: aceita gameLink; mensagem reflete PRÉ-SINAL (2 azuis detectadas — aguarda roxa)
+// Isso bate com a fase 'pre_sinal' do SignalPage, que chama /whatsapp/warning
+export async function alertWarning(strategyName: string, targets?: string[], gameLink?: string): Promise<void> {
   if (state.conn !== 'open') return
   const dest = targets?.length ? targets : getSavedTargets()
   if (!dest.length) return
-  const msg = `⚠️ *PRÉ-SINAL IDENTIFICADO*\n━━━━━━━━━━━━━━━━━━━━\n🤖 Estratégia: *${strategyName}*\n🎯 Status: *Aguardando confirmação*\n📱 Fique atento para a entrada!\n⏱ ${hora()}`
+
+  const link = gameLink || GAME_LINK_DEFAULT
+  const msg =
+    `⚠️ *PRÉ-SINAL IDENTIFICADO*\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `🤖 Estratégia: *${strategyName}*\n` +
+    `🔵 2 velas azuis detectadas — aguardando a ROXA!\n` +
+    `📱 Prepare-se para entrar na próxima vela!\n` +
+    `⏱ ${hora()}\n\n` +
+    `🔗 [Clique aqui para abrir o jogo](${link})`
   await sendToTargets(dest, msg, `warning_${strategyName}`)
 }
 
-export async function alertConfirmed(strategyName: string, targets?: string[]): Promise<void> {
+// FIX: gameLink agora vem do parâmetro (antes usava GAME_LINK indefinido → erro runtime)
+export async function alertConfirmed(strategyName: string, targets?: string[], gameLink?: string): Promise<void> {
   if (state.conn !== 'open') return
   const dest = targets?.length ? targets : getSavedTargets()
   if (!dest.length) return
-  const msg = `🚀 *ENTRADA CONFIRMADA*\n━━━━━━━━━━━━━━━━━━━━\n🤖 Estratégia: *${strategyName}*\n✅ *ENTRAR AGORA NA PRÓXIMA VELA*\n🎯 Alvo: *2.00x*\n🛡 Proteção: *Até G1*\n⏱ ${hora()}\n\n🔗 [Clique aqui para abrir o jogo](${GAME_LINK})`
+
+  const link = gameLink || GAME_LINK_DEFAULT
+  const msg =
+    `🚀 *ENTRADA CONFIRMADA*\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `🤖 Estratégia: *${strategyName}*\n` +
+    `✅ *ENTRAR AGORA NA PRÓXIMA VELA*\n` +
+    `🎯 Alvo: *2.00x*\n` +
+    `🛡 Proteção: *Até G1*\n` +
+    `⏱ ${hora()}\n\n` +
+    `🔗 [Clique aqui para abrir o jogo](${link})`
   await sendToTargets(dest, msg, `confirmed_${strategyName}`)
 }
 
@@ -234,16 +275,48 @@ export async function alertGale(strategyName: string, targets?: string[]): Promi
   if (state.conn !== 'open') return
   const dest = targets?.length ? targets : getSavedTargets()
   if (!dest.length) return
-  const msg = `🔄 *MARTINGALE 1 (G1)*\n━━━━━━━━━━━━━━━━━━━━\n🤖 Estratégia: *${strategyName}*\n⚠️ A primeira não pagou, entrar novamente!\n🎯 Alvo: *2.00x*\n⏱ ${hora()}`
+
+  const msg =
+    `🔄 *MARTINGALE 1 (G1)*\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `🤖 Estratégia: *${strategyName}*\n` +
+    `⚠️ A primeira não pagou — entrar novamente!\n` +
+    `🎯 Alvo: *2.00x*\n` +
+    `⏱ ${hora()}`
   await sendToTargets(dest, msg, `gale_${strategyName}`)
 }
 
-export async function alertResult(strategyName: string, result: string, multiplier: number, targets?: string[], score?: SessionScore): Promise<void> {
+// FIX: result agora é 'win_g1' | 'win_g2' | 'loss' (igual ao SignalPage)
+// Antes usava result.startsWith('win') sem distinguir G1 de G2 na mensagem.
+// Spam key usa Date.now() para nunca bloquear resultados sequenciais (comportamento correto).
+export async function alertResult(
+  strategyName: string,
+  result: 'win_g1' | 'win_g2' | 'loss',
+  multiplier: number,
+  targets?: string[],
+  score?: SessionScore,
+): Promise<void> {
   if (state.conn !== 'open') return
   const dest = targets?.length ? targets : getSavedTargets()
   if (!dest.length) return
-  const isWin = result.startsWith('win')
-  const msg = `${isWin ? '✅' : '❌'} *${isWin ? 'GREEN CONFIRMADO!' : 'LOSS (STOP LOSS)'}*\n━━━━━━━━━━━━━━━━━━━━\n🤖 Estratégia: *${strategyName}*\n📊 Resultado: *${multiplier.toFixed(2)}x*\n⏱ ${hora()}${formatScore(score)}`
+
+  let header: string
+  if (result === 'win_g1') {
+    header = `✅ *GREEN CONFIRMADO! (Direto — G0)*\n📊 Resultado: *${multiplier.toFixed(2)}x*`
+  } else if (result === 'win_g2') {
+    header = `✅ *GREEN NO GALE! (Martingale — G1)*\n📊 Resultado: *${multiplier.toFixed(2)}x*`
+  } else {
+    header = `❌ *LOSS (Stop Loss atingido)*\n📊 Resultado: *${multiplier.toFixed(2)}x*`
+  }
+
+  const msg =
+    `${result === 'loss' ? '❌' : '✅'} ${header}\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `🤖 Estratégia: *${strategyName}*\n` +
+    `⏱ ${hora()}` +
+    formatScore(score)
+
+  // Timestamp garante que cada resultado é enviado, sem bloqueio por anti-spam
   await sendToTargets(dest, msg, `result_${strategyName}_${Date.now()}`)
 }
 
@@ -251,7 +324,13 @@ export async function alertStrategySignal(strategyName: string, signalMsg: strin
   if (state.conn !== 'open') return
   const dest = targets?.length ? targets : getSavedTargets()
   if (!dest.length) return
-  const msg = `🤖 *SINAL DE ESTRATÉGIA*\n━━━━━━━━━━━━━━━━━━━━\n📈 Estratégia: *${strategyName}*\n💬 Mensagem: ${signalMsg}\n⏱ ${hora()}`
+
+  const msg =
+    `🤖 *SINAL DE ESTRATÉGIA*\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `📈 Estratégia: *${strategyName}*\n` +
+    `💬 Mensagem: ${signalMsg}\n` +
+    `⏱ ${hora()}`
   await sendToTargets(dest, msg, `signal_${strategyName}`)
 }
 
