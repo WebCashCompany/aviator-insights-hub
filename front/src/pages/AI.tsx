@@ -16,6 +16,21 @@ type ChatMessage = {
   ts:      string
 }
 
+// ── helpers de persistência ──────────────────────────────────────────────────
+function readSession<T>(key: string, fallback: T): T {
+  try {
+    const raw = sessionStorage.getItem(key)
+    return raw ? (JSON.parse(raw) as T) : fallback
+  } catch {
+    return fallback
+  }
+}
+
+function writeSession(key: string, value: unknown) {
+  try { sessionStorage.setItem(key, JSON.stringify(value)) } catch {}
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
 function ConfidenceBar({ value }: { value: number }) {
   const pct   = Math.round(value * 100)
   const color = pct >= 70 ? 'bg-emerald-500' : pct >= 45 ? 'bg-amber-500' : 'bg-red-500'
@@ -66,14 +81,24 @@ function QuickPrompt({ label, onClick }: { label: string; onClick: () => void })
 export default function AIPage() {
   const { candles } = useCandles({ limit: 1000 })
 
-  const [analysis,   setAnalysis]   = useState<AIAnalysis | null>(null)
+  // ── estado persistido ──────────────────────────────────────────────────────
+  const [analysis, setAnalysis] = useState<AIAnalysis | null>(
+    () => readSession<AIAnalysis | null>('ai_analysis', null)
+  )
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>(
+    () => readSession<ChatMessage[]>('ai_chat', [])
+  )
+  // ──────────────────────────────────────────────────────────────────────────
+
   const [analyzing,  setAnalyzing]  = useState(false)
   const [analyzeErr, setAnalyzeErr] = useState<string | null>(null)
-
-  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
-  const [chatInput,    setChatInput]    = useState('')
-  const [isTyping,     setIsTyping]     = useState(false)
+  const [chatInput,  setChatInput]  = useState('')
+  const [isTyping,   setIsTyping]   = useState(false)
   const chatEndRef = useRef<HTMLDivElement>(null)
+
+  // persiste sempre que mudam
+  useEffect(() => { writeSession('ai_analysis', analysis) },     [analysis])
+  useEffect(() => { writeSession('ai_chat', chatMessages) }, [chatMessages])
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -157,10 +182,7 @@ export default function AIPage() {
             <p className="text-xs text-muted-foreground mt-0.5">Motor IA · {candles.length} velas</p>
           </div>
         </div>
-        <div className="text-right">
-          <p className="text-[10px] text-muted-foreground uppercase font-semibold tracking-widest">Banca</p>
-          <p className="text-lg font-mono font-bold text-primary">$500.00</p>
-        </div>
+       
       </header>
 
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
