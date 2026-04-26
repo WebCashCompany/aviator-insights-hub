@@ -1,55 +1,35 @@
-import { GoogleGenerativeAI, GenerativeModel, ChatSession } from "@google/generative-ai";
 import { Candle, AIAnalysis } from '@/types';
 
 const API_KEY = import.meta.env.VITE_GEMINI_API_KEY || '';
+const BASE = 'https://generativelanguage.googleapis.com/v1/models';
+const MODEL_ANALYSIS = 'gemini-2.0-flash-lite';
+const MODEL_CHAT     = 'gemini-2.0-flash-lite';
 
 if (!API_KEY) {
   console.error('[aiService] VITE_GEMINI_API_KEY não configurada no .env');
 }
 
-const genAI = new GoogleGenerativeAI(API_KEY);
-
-function getAnalysisModel(): GenerativeModel {
-  return genAI.getGenerativeModel({
-    model: "gemini-1.5-flash",
-    generationConfig: {
-      responseMimeType: "application/json",
-      temperature: 0.3,
-      topP: 0.85,
-      maxOutputTokens: 8192,
-    },
-    systemInstruction: `
-      Você é um analista de Aviator Crash Game.
-      Regras: Alvo 1.99x. Azul < 1.99x. Roxo 1.99x-9.99x. Rosa >= 10x.
-      Entrada R$5, Gale máximo R$10. Máximo 1 martingale.
-      Responda APENAS JSON válido, sem markdown.
-    `.trim(),
+async function callGemini(model: string, body: object): Promise<string> {
+  const res = await fetch(`${BASE}/${model}:generateContent?key=${API_KEY}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
   });
-}
 
-function getChatModel(): GenerativeModel {
-  return genAI.getGenerativeModel({
-    model: "gemini-1.5-flash",
-    generationConfig: {
-      temperature: 0.6,
-      topP: 0.9,
-      maxOutputTokens: 1024,
-    },
-    systemInstruction: `
-      Assistente estratégico de Aviator Crash Game.
-      Responda direto, conciso, em português.
-      Máximo 1 entrada + 1 martingale. Se perder os dois, PARAR.
-      Máximo 3 parágrafos curtos.
-    `.trim(),
-  });
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Gemini ${res.status}: ${err}`);
+  }
+
+  const data = await res.json();
+  return data.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
 }
 
 function buildCandleStats(candles: Candle[]) {
-  const reversed = [...candles].reverse()
-
-  const last60 = reversed.slice(0, 60)
-  const last20 = reversed.slice(0, 20)
-  const last10 = reversed.slice(0, 10)
+  const reversed = [...candles].reverse();
+  const last60 = reversed.slice(0, 60);
+  const last20 = reversed.slice(0, 20);
+  const last10 = reversed.slice(0, 10);
 
   const count = (arr: Candle[], fn: (c: Candle) => boolean) => arr.filter(fn).length;
   const pct   = (n: number, total: number) => total ? ((n / total) * 100).toFixed(1) : '0';
@@ -107,19 +87,20 @@ export async function analyzeCandles(candles: Candle[]): Promise<AIAnalysis> {
     return buildErrorAnalysis('Dados insuficientes. Aguarde pelo menos 10 velas.');
   }
 
-  const stats = buildCandleStats(candles);
-  const model = getAnalysisModel();
+  const stats  = buildCandleStats(candles);
+  const prompt = `Você é um analista de Aviator Crash Game. Responda APENAS JSON válido, sem markdown.
 
-  const prompt = `Dados: ${JSON.stringify(stats)}
+Dados: ${JSON.stringify(stats)}
 
-Retorne este JSON exato:
+Retorne exatamente este JSON:
 {"resumo":"...","padrao":"...","estrategiaRecomendada":"ENTRAR ou AGUARDAR ou ABORTAR","confianca":0.0,"nivelRisco":"BAIXO ou MEDIO ou ALTO","melhorMomento":"...","gestaoGale":"Sem gale ou Ate 1 gale","insights":["...","...","..."],"alertas":["..."]}`;
 
   try {
-    const result = await model.generateContent(prompt);
-    const text   = cleanJSON(result.response.text());
-    const parsed = JSON.parse(text) as AIAnalysis;
-    return parsed;
+    const text = await callGemini(MODEL_ANALYSIS, {
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      generationConfig: { temperature: 0.3, topP: 0.85, maxOutputTokens: 2048 },
+    });
+    return JSON.parse(cleanJSON(text)) as AIAnalysis;
   } catch (error) {
     console.error('[aiService] Erro na análise:', error);
     return buildErrorAnalysis('Falha ao processar análise. Verifique a chave VITE_GEMINI_API_KEY.');
@@ -131,20 +112,27 @@ export async function askAIAboutPatterns(
   candles: Candle[],
   history: { role: string; content: string }[] = [],
 ): Promise<string> {
-  const model = getChatModel();
-  const stats = buildCandleStats(candles);
-
+  const stats   = buildCandleStats(candles);
   const context = `Última vela: ${stats.ultimaVela} | Sequência recente: ${stats.u10} | 60v: ${stats.j60.azul.p}% azuis ${stats.j60.roxo.p}% roxas ${stats.j60.rosa.p}% rosas | Média: ${stats.j60.avg}x | Streak atual: ${stats.streak.n}x ${stats.streak.cor}`;
 
-  const chatHistory = history.slice(-6).map(msg => ({
-    role: (msg.role === 'assistant' ? 'model' : 'user') as 'user' | 'model',
-    parts: [{ text: msg.content }],
-  }));
+  const systemMsg = `Assistente estratégico de Aviator Crash Game. Responda direto, conciso, em português. Máximo 1 entrada + 1 martingale. Se perder os dois, PARAR. Máximo 3 parágrafos curtos.`;
+
+  const contents = [
+    { role: 'user',  parts: [{ text: systemMsg }] },
+    { role: 'model', parts: [{ text: 'Entendido. Estou pronto para ajudar.' }] },
+    ...history.slice(-6).map(m => ({
+      role:  m.role === 'assistant' ? 'model' : 'user',
+      parts: [{ text: m.content }],
+    })),
+    { role: 'user', parts: [{ text: `Contexto: ${context}\n\nPergunta: ${question}` }] },
+  ];
 
   try {
-    const chat: ChatSession = model.startChat({ history: chatHistory });
-    const result = await chat.sendMessage(`${context}\n\nPergunta: ${question}`);
-    return result.response.text().trim();
+    const text = await callGemini(MODEL_CHAT, {
+      contents,
+      generationConfig: { temperature: 0.6, topP: 0.9, maxOutputTokens: 1024 },
+    });
+    return text.trim();
   } catch (error) {
     console.error('[aiService] Erro no chat:', error);
     return 'Erro ao processar sua pergunta. Verifique a conexão e a chave da API.';
