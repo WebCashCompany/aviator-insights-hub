@@ -11,7 +11,7 @@ const genAI = new GoogleGenerativeAI(API_KEY);
 
 function getAnalysisModel(): GenerativeModel {
   return genAI.getGenerativeModel({
-    model: "gemini-2.5-flash",
+    model: "gemini-1.5-flash",
     generationConfig: {
       responseMimeType: "application/json",
       temperature: 0.3,
@@ -29,7 +29,7 @@ function getAnalysisModel(): GenerativeModel {
 
 function getChatModel(): GenerativeModel {
   return genAI.getGenerativeModel({
-    model: "gemini-2.5-flash",
+    model: "gemini-1.5-flash",
     generationConfig: {
       temperature: 0.6,
       topP: 0.9,
@@ -45,7 +45,6 @@ function getChatModel(): GenerativeModel {
 }
 
 function buildCandleStats(candles: Candle[]) {
-  // Velas chegam antiga→recente. Invertemos para ter recente→antiga
   const reversed = [...candles].reverse()
 
   const last60 = reversed.slice(0, 60)

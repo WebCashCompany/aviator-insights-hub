@@ -4,7 +4,7 @@ import { analyzeCandles, askAIAboutPatterns } from '@/services/aiService'
 import { AIAnalysis } from '@/types'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { Brain, Send, Sparkles, TrendingUp, AlertTriangle, ShieldCheck, ShieldAlert, Loader2, ChevronRight } from 'lucide-react'
+import { Brain, Send, Sparkles, TrendingUp, AlertTriangle, ShieldCheck, ShieldAlert, Loader2, ChevronRight, Trash2 } from 'lucide-react'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Badge } from '@/components/ui/badge'
 import { cn } from '@/lib/utils'
@@ -16,20 +16,20 @@ type ChatMessage = {
   ts:      string
 }
 
-// ── helpers de persistência ──────────────────────────────────────────────────
 function readSession<T>(key: string, fallback: T): T {
   try {
     const raw = sessionStorage.getItem(key)
     return raw ? (JSON.parse(raw) as T) : fallback
-  } catch {
-    return fallback
-  }
+  } catch { return fallback }
 }
 
 function writeSession(key: string, value: unknown) {
   try { sessionStorage.setItem(key, JSON.stringify(value)) } catch {}
 }
-// ─────────────────────────────────────────────────────────────────────────────
+
+function clearSession(key: string) {
+  try { sessionStorage.removeItem(key) } catch {}
+}
 
 function ConfidenceBar({ value }: { value: number }) {
   const pct   = Math.round(value * 100)
@@ -41,10 +41,7 @@ function ConfidenceBar({ value }: { value: number }) {
         <span className="font-bold">{pct}%</span>
       </div>
       <div className="h-1.5 w-full bg-muted rounded-full overflow-hidden">
-        <div
-          className={cn('h-full rounded-full transition-all duration-700', color)}
-          style={{ width: `${pct}%` }}
-        />
+        <div className={cn('h-full rounded-full transition-all duration-700', color)} style={{ width: `${pct}%` }} />
       </div>
     </div>
   )
@@ -81,23 +78,16 @@ function QuickPrompt({ label, onClick }: { label: string; onClick: () => void })
 export default function AIPage() {
   const { candles } = useCandles({ limit: 1000 })
 
-  // ── estado persistido ──────────────────────────────────────────────────────
-  const [analysis, setAnalysis] = useState<AIAnalysis | null>(
-    () => readSession<AIAnalysis | null>('ai_analysis', null)
-  )
-  const [chatMessages, setChatMessages] = useState<ChatMessage[]>(
-    () => readSession<ChatMessage[]>('ai_chat', [])
-  )
-  // ──────────────────────────────────────────────────────────────────────────
-
+  const [analysis,   setAnalysis]   = useState<AIAnalysis | null>(() => readSession<AIAnalysis | null>('ai_analysis', null))
   const [analyzing,  setAnalyzing]  = useState(false)
   const [analyzeErr, setAnalyzeErr] = useState<string | null>(null)
-  const [chatInput,  setChatInput]  = useState('')
-  const [isTyping,   setIsTyping]   = useState(false)
+
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>(() => readSession<ChatMessage[]>('ai_chat', []))
+  const [chatInput,    setChatInput]    = useState('')
+  const [isTyping,     setIsTyping]     = useState(false)
   const chatEndRef = useRef<HTMLDivElement>(null)
 
-  // persiste sempre que mudam
-  useEffect(() => { writeSession('ai_analysis', analysis) },     [analysis])
+  useEffect(() => { writeSession('ai_analysis', analysis) },  [analysis])
   useEffect(() => { writeSession('ai_chat', chatMessages) }, [chatMessages])
 
   useEffect(() => {
@@ -119,6 +109,17 @@ export default function AIPage() {
     } finally {
       setAnalyzing(false)
     }
+  }
+
+  const handleClearAnalysis = () => {
+    setAnalysis(null)
+    setAnalyzeErr(null)
+    clearSession('ai_analysis')
+  }
+
+  const handleClearChat = () => {
+    setChatMessages([])
+    clearSession('ai_chat')
   }
 
   const sendChat = async (text: string) => {
@@ -182,7 +183,10 @@ export default function AIPage() {
             <p className="text-xs text-muted-foreground mt-0.5">Motor IA · {candles.length} velas</p>
           </div>
         </div>
-       
+        <div className="text-right">
+          <p className="text-[10px] text-muted-foreground uppercase font-semibold tracking-widest">Banca</p>
+          <p className="text-lg font-mono font-bold text-primary">$500.00</p>
+        </div>
       </header>
 
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
@@ -195,16 +199,21 @@ export default function AIPage() {
               Analisa as últimas {Math.min(candles.length, 60)} velas
             </p>
           </div>
-          <Button
-            onClick={handleAnalyze}
-            disabled={analyzing}
-            className="w-full font-bold h-11"
-          >
+          <Button onClick={handleAnalyze} disabled={analyzing} className="w-full font-bold h-11">
             {analyzing
               ? <><Loader2 className="w-4 h-4 mr-2 animate-spin" />PROCESSANDO...</>
               : 'EXECUTAR ANÁLISE'
             }
           </Button>
+          {analysis && !analyzing && (
+            <button
+              onClick={handleClearAnalysis}
+              className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-destructive transition-colors"
+            >
+              <Trash2 className="w-3 h-3" />
+              Limpar análise
+            </button>
+          )}
           {analyzeErr && (
             <p className="text-xs text-destructive flex items-start gap-1">
               <AlertTriangle className="w-3 h-3 mt-0.5 shrink-0" />{analyzeErr}
@@ -225,12 +234,10 @@ export default function AIPage() {
             </div>
           ) : analysis ? (
             <div className="animate-in fade-in slide-in-from-right-2 duration-500 space-y-3">
-
               <div className="glass-card p-4 border-l-4 border-primary bg-primary/5">
                 <p className="text-[10px] font-bold text-primary uppercase tracking-widest mb-1.5">Resumo Operacional</p>
                 <p className="text-sm leading-relaxed">{analysis.resumo}</p>
               </div>
-
               <div className="grid grid-cols-3 gap-3">
                 <div className="glass-card p-3 text-center">
                   <p className="text-[10px] text-muted-foreground uppercase">Padrão</p>
@@ -245,14 +252,12 @@ export default function AIPage() {
                   <p className="text-xs font-semibold mt-1 leading-tight">{analysis.gestaoGale}</p>
                 </div>
               </div>
-
               <div className="glass-card p-3 flex items-center justify-between gap-4">
                 <SignalBadge strategy={analysis.estrategiaRecomendada} risk={analysis.nivelRisco} />
                 <div className="flex-1">
                   <ConfidenceBar value={analysis.confianca} />
                 </div>
               </div>
-
               {analysis.insights?.length > 0 && (
                 <div className="glass-card p-3 space-y-1.5">
                   <p className="text-[10px] font-bold text-muted-foreground uppercase tracking-widest">Insights</p>
@@ -264,7 +269,6 @@ export default function AIPage() {
                   ))}
                 </div>
               )}
-
               {analysis.alertas?.filter(Boolean).length > 0 && (
                 <div className="glass-card p-3 bg-destructive/5 border-destructive/20 space-y-1">
                   {analysis.alertas.filter(Boolean).map((alerta, i) => (
@@ -294,9 +298,20 @@ export default function AIPage() {
             <TrendingUp className="w-4 h-4 text-primary" />
             <span className="text-xs font-bold uppercase tracking-widest">Consultoria Estratégica</span>
           </div>
-          <Badge variant="outline" className="text-[10px] text-emerald-500 border-emerald-500/30 bg-emerald-500/10">
-            IA Online
-          </Badge>
+          <div className="flex items-center gap-2">
+            {chatMessages.length > 0 && (
+              <button
+                onClick={handleClearChat}
+                className="flex items-center gap-1 text-xs text-muted-foreground hover:text-destructive transition-colors"
+              >
+                <Trash2 className="w-3 h-3" />
+                Limpar chat
+              </button>
+            )}
+            <Badge variant="outline" className="text-[10px] text-emerald-500 border-emerald-500/30 bg-emerald-500/10">
+              IA Online
+            </Badge>
+          </div>
         </div>
 
         <div className="flex-1 overflow-y-auto p-4 space-y-3 bg-black/5">
@@ -313,10 +328,7 @@ export default function AIPage() {
           )}
 
           {chatMessages.map(msg => (
-            <div
-              key={msg.id}
-              className={cn('flex gap-2', msg.role === 'user' ? 'justify-end' : 'justify-start')}
-            >
+            <div key={msg.id} className={cn('flex gap-2', msg.role === 'user' ? 'justify-end' : 'justify-start')}>
               {msg.role === 'assistant' && (
                 <div className="w-6 h-6 rounded-full bg-primary/10 flex items-center justify-center shrink-0 mt-1">
                   <Brain className="w-3.5 h-3.5 text-primary" />
@@ -329,10 +341,7 @@ export default function AIPage() {
                   : 'bg-muted/80 border rounded-tl-sm'
               )}>
                 <p>{msg.content}</p>
-                <p className={cn(
-                  'text-[10px] mt-1',
-                  msg.role === 'user' ? 'text-primary-foreground/60' : 'text-muted-foreground'
-                )}>{msg.ts}</p>
+                <p className={cn('text-[10px] mt-1', msg.role === 'user' ? 'text-primary-foreground/60' : 'text-muted-foreground')}>{msg.ts}</p>
               </div>
             </div>
           ))}
@@ -364,10 +373,7 @@ export default function AIPage() {
             disabled={isTyping}
           />
           <Button type="submit" size="icon" disabled={isTyping} className="h-10 w-10 shrink-0">
-            {isTyping
-              ? <Loader2 className="w-4 h-4 animate-spin" />
-              : <Send className="w-4 h-4" />
-            }
+            {isTyping ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
           </Button>
         </form>
       </div>
