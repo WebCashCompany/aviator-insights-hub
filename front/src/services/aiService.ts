@@ -16,22 +16,13 @@ function getAnalysisModel(): GenerativeModel {
       responseMimeType: "application/json",
       temperature: 0.3,
       topP: 0.85,
-      maxOutputTokens: 2048,
+      maxOutputTokens: 8192,
     },
     systemInstruction: `
-      Você é um analista especializado em Aviator Crash Game.
-      Sua função é identificar padrões estatísticos nas velas (multiplicadores) e
-      fornecer recomendações operacionais baseadas em probabilidade.
-      
-      Regras do sistema:
-      - Alvo padrão: 1.99x
-      - Azul  = multiplicador < 1.99x (perdeu o alvo)
-      - Roxo  = multiplicador entre 1.99x e 9.99x
-      - Rosa  = multiplicador >= 10x
-      - Entrada base: R$5 | Gale 1: R$10 (MÁXIMO — sem Gale 2)
-      - Gestão: máximo 1 entrada + 1 martingale. Se perder os dois, PARAR.
-      
-      Sempre responda APENAS com JSON válido, sem markdown, sem comentários.
+      Você é um analista de Aviator Crash Game.
+      Regras: Alvo 1.99x. Azul < 1.99x. Roxo 1.99x-9.99x. Rosa >= 10x.
+      Entrada R$5, Gale máximo R$10. Máximo 1 martingale.
+      Responda APENAS JSON válido, sem markdown.
     `.trim(),
   });
 }
@@ -45,31 +36,33 @@ function getChatModel(): GenerativeModel {
       maxOutputTokens: 1024,
     },
     systemInstruction: `
-      Você é um assistente estratégico especialista em Aviator Crash Game.
-      Responda de forma direta, concisa e em português.
-      Foque em análise probabilística e gestão de banca.
-      Gestão: máximo 1 entrada + 1 martingale. Se perder os dois, PARAR.
-      Máximo 3 parágrafos curtos por resposta.
+      Assistente estratégico de Aviator Crash Game.
+      Responda direto, conciso, em português.
+      Máximo 1 entrada + 1 martingale. Se perder os dois, PARAR.
+      Máximo 3 parágrafos curtos.
     `.trim(),
   });
 }
 
 function buildCandleStats(candles: Candle[]) {
-  const last60  = candles.slice(0, 60);
-  const last20  = candles.slice(0, 20);
-  const last10  = candles.slice(0, 10);
+  // Velas chegam antiga→recente. Invertemos para ter recente→antiga
+  const reversed = [...candles].reverse()
 
-  const count  = (arr: Candle[], fn: (c: Candle) => boolean) => arr.filter(fn).length;
-  const pct    = (n: number, total: number) => total ? ((n / total) * 100).toFixed(1) : '0';
-  const avg    = (arr: Candle[]) =>
+  const last60 = reversed.slice(0, 60)
+  const last20 = reversed.slice(0, 20)
+  const last10 = reversed.slice(0, 10)
+
+  const count = (arr: Candle[], fn: (c: Candle) => boolean) => arr.filter(fn).length;
+  const pct   = (n: number, total: number) => total ? ((n / total) * 100).toFixed(1) : '0';
+  const avg   = (arr: Candle[]) =>
     arr.length ? (arr.reduce((s, c) => s + c.multiplicador, 0) / arr.length).toFixed(2) : '0';
 
-  const azul60  = count(last60,  c => c.cor === 'blue');
-  const roxo60  = count(last60,  c => c.cor === 'purple');
-  const rosa60  = count(last60,  c => c.cor === 'pink');
-  const azul20  = count(last20,  c => c.cor === 'blue');
-  const maxMult = Math.max(...candles.slice(0, 100).map(c => c.multiplicador));
-  const minMult = Math.min(...candles.slice(0, 100).map(c => c.multiplicador));
+  const azul60 = count(last60, c => c.cor === 'blue');
+  const roxo60 = count(last60, c => c.cor === 'purple');
+  const rosa60 = count(last60, c => c.cor === 'pink');
+  const azul20 = count(last20, c => c.cor === 'blue');
+  const maxMult = Math.max(...last60.map(c => c.multiplicador));
+  const minMult = Math.min(...last60.map(c => c.multiplicador));
 
   let streak = 0;
   const streakCor = last10[0]?.cor;
@@ -86,21 +79,20 @@ function buildCandleStats(candles: Candle[]) {
   }
 
   return {
-    janela60: {
+    j60: {
       total: last60.length,
-      azul:  { count: azul60,  pct: pct(azul60,  last60.length) },
-      roxo:  { count: roxo60,  pct: pct(roxo60,  last60.length) },
-      rosa:  { count: rosa60,  pct: pct(rosa60,  last60.length) },
-      media: avg(last60),
+      azul:  { n: azul60, p: pct(azul60, last60.length) },
+      roxo:  { n: roxo60, p: pct(roxo60, last60.length) },
+      rosa:  { n: rosa60, p: pct(rosa60, last60.length) },
+      avg:   avg(last60),
     },
-    janela20: {
-      azul: { count: azul20, pct: pct(azul20, last20.length) },
-      media: avg(last20),
-    },
-    ultimas10: last10.map(c => ({ mult: c.multiplicador, cor: c.cor })),
-    streakAtual:     { cor: streakCor, quantidade: streak },
-    maiorStreakAzul: maxAzulStreak,
-    extremos:        { max: maxMult.toFixed(2), min: minMult.toFixed(2) },
+    j20: { azulN: azul20, azulP: pct(azul20, last20.length), avg: avg(last20) },
+    u10: last10.map(c => `${c.multiplicador}x`).join(','),
+    ultimaVela: last10[0] ? `${last10[0].multiplicador}x (${last10[0].cor})` : 'N/A',
+    streak: { cor: streakCor, n: streak },
+    maxAzulStreak,
+    max: maxMult.toFixed(2),
+    min: minMult.toFixed(2),
   };
 }
 
@@ -116,34 +108,13 @@ export async function analyzeCandles(candles: Candle[]): Promise<AIAnalysis> {
     return buildErrorAnalysis('Dados insuficientes. Aguarde pelo menos 10 velas.');
   }
 
-  const stats  = buildCandleStats(candles);
-  const model  = getAnalysisModel();
+  const stats = buildCandleStats(candles);
+  const model = getAnalysisModel();
 
-  const prompt = `
-Analise os dados das velas do Aviator abaixo e retorne uma análise completa.
+  const prompt = `Dados: ${JSON.stringify(stats)}
 
-DADOS ESTATÍSTICOS:
-${JSON.stringify(stats, null, 2)}
-
-RETORNE EXATAMENTE este JSON (sem campos extras, sem markdown):
-{
-  "resumo": "<resumo operacional em 2-3 frases, mencione o % de azuis e tendência>",
-  "padrao": "<nome do padrão identificado, ex: 'Vácuo de Azuis', 'Saturação Roxa', 'Neutro'>",
-  "estrategiaRecomendada": "<ENTRAR | AGUARDAR | ABORTAR>",
-  "confianca": <número entre 0.0 e 1.0>,
-  "nivelRisco": "<BAIXO | MÉDIO | ALTO>",
-  "melhorMomento": "<descrição de quando entrar, ex: 'Após próxima azul' ou 'Imediatamente'>",
-  "gestaoGale": "<'Sem gale' | 'Até 1 gale'>",
-  "insights": [
-    "<insight 1 relevante>",
-    "<insight 2 relevante>",
-    "<insight 3 relevante>"
-  ],
-  "alertas": [
-    "<alerta 1 se houver risco, ou null>"
-  ]
-}
-  `.trim();
+Retorne este JSON exato:
+{"resumo":"...","padrao":"...","estrategiaRecomendada":"ENTRAR ou AGUARDAR ou ABORTAR","confianca":0.0,"nivelRisco":"BAIXO ou MEDIO ou ALTO","melhorMomento":"...","gestaoGale":"Sem gale ou Ate 1 gale","insights":["...","...","..."],"alertas":["..."]}`;
 
   try {
     const result = await model.generateContent(prompt);
@@ -161,19 +132,13 @@ export async function askAIAboutPatterns(
   candles: Candle[],
   history: { role: string; content: string }[] = [],
 ): Promise<string> {
-  const model   = getChatModel();
-  const stats   = buildCandleStats(candles);
+  const model = getChatModel();
+  const stats = buildCandleStats(candles);
 
-  const context = `
-Contexto atual (últimas 20 velas):
-- Sequência: ${stats.ultimas10.map(c => `${c.mult}x`).join(', ')}
-- Janela 60 velas: ${stats.janela60.azul.pct}% azuis | ${stats.janela60.roxo.pct}% roxas | ${stats.janela60.rosa.pct}% rosas
-- Média: ${stats.janela60.media}x
-- Streak atual: ${stats.streakAtual.quantidade}x "${stats.streakAtual.cor}"
-  `.trim();
+  const context = `Última vela: ${stats.ultimaVela} | Sequência recente: ${stats.u10} | 60v: ${stats.j60.azul.p}% azuis ${stats.j60.roxo.p}% roxas ${stats.j60.rosa.p}% rosas | Média: ${stats.j60.avg}x | Streak atual: ${stats.streak.n}x ${stats.streak.cor}`;
 
   const chatHistory = history.slice(-6).map(msg => ({
-    role: msg.role as 'user' | 'model',
+    role: (msg.role === 'assistant' ? 'model' : 'user') as 'user' | 'model',
     parts: [{ text: msg.content }],
   }));
 
@@ -189,14 +154,14 @@ Contexto atual (últimas 20 velas):
 
 function buildErrorAnalysis(mensagem: string): AIAnalysis {
   return {
-    resumo:                 mensagem,
-    padrao:                 'Erro',
-    estrategiaRecomendada:  'AGUARDAR',
-    confianca:              0,
-    nivelRisco:             'ALTO',
-    melhorMomento:          'Indisponível',
-    gestaoGale:             'Sem gale',
-    insights:               ['Verifique o arquivo .env', 'Confirme a chave VITE_GEMINI_API_KEY'],
-    alertas:                [mensagem],
+    resumo:                mensagem,
+    padrao:                'Erro',
+    estrategiaRecomendada: 'AGUARDAR',
+    confianca:             0,
+    nivelRisco:            'ALTO',
+    melhorMomento:         'Indisponível',
+    gestaoGale:            'Sem gale',
+    insights:              ['Verifique o arquivo .env', 'Confirme a chave VITE_GEMINI_API_KEY'],
+    alertas:               [mensagem],
   };
 }
