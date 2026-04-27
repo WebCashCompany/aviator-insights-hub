@@ -1,9 +1,9 @@
 import { Candle, AIAnalysis } from '@/types';
 
 const API_KEY = import.meta.env.VITE_GEMINI_API_KEY || '';
-const BASE = 'https://generativelanguage.googleapis.com/v1/models';
-const MODEL_ANALYSIS = 'gemini-2.0-flash-lite';
-const MODEL_CHAT     = 'gemini-2.0-flash-lite';
+const BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
+const MODEL_ANALYSIS = 'gemini-2.5-flash';
+const MODEL_CHAT     = 'gemini-2.5-flash';
 
 if (!API_KEY) {
   console.error('[aiService] VITE_GEMINI_API_KEY não configurada no .env');
@@ -76,6 +76,8 @@ function buildCandleStats(candles: Candle[]) {
 }
 
 function cleanJSON(text: string): string {
+  const match = text.match(/\{[\s\S]*\}/);
+  if (match) return match[0];
   return text
     .replace(/```json\s*/gi, '')
     .replace(/```\s*/gi, '')
@@ -88,17 +90,23 @@ export async function analyzeCandles(candles: Candle[]): Promise<AIAnalysis> {
   }
 
   const stats  = buildCandleStats(candles);
-  const prompt = `Você é um analista de Aviator Crash Game. Responda APENAS JSON válido, sem markdown.
+  const prompt = `Você é um analista de Aviator Crash Game. Responda APENAS com um objeto JSON válido e completo, sem markdown, sem texto antes ou depois.
 
 Dados: ${JSON.stringify(stats)}
 
-Retorne exatamente este JSON:
-{"resumo":"...","padrao":"...","estrategiaRecomendada":"ENTRAR ou AGUARDAR ou ABORTAR","confianca":0.0,"nivelRisco":"BAIXO ou MEDIO ou ALTO","melhorMomento":"...","gestaoGale":"Sem gale ou Ate 1 gale","insights":["...","...","..."],"alertas":["..."]}`;
+Retorne EXATAMENTE este JSON preenchido (todos os campos obrigatórios):
+{"resumo":"...","padrao":"...","estrategiaRecomendada":"ENTRAR","confianca":0.0,"nivelRisco":"BAIXO","melhorMomento":"...","gestaoGale":"Sem gale","insights":["...","...","..."],"alertas":["..."]}`;
 
   try {
     const text = await callGemini(MODEL_ANALYSIS, {
       contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      generationConfig: { temperature: 0.3, topP: 0.85, maxOutputTokens: 2048 },
+      generationConfig: {
+        temperature: 0.1,
+        topP: 0.8,
+        maxOutputTokens: 4000,
+        responseMimeType: 'application/json',
+        thinkingConfig: { thinkingBudget: 0 },
+      },
     });
     return JSON.parse(cleanJSON(text)) as AIAnalysis;
   } catch (error) {
@@ -130,7 +138,12 @@ export async function askAIAboutPatterns(
   try {
     const text = await callGemini(MODEL_CHAT, {
       contents,
-      generationConfig: { temperature: 0.6, topP: 0.9, maxOutputTokens: 1024 },
+      generationConfig: {
+        temperature: 0.6,
+        topP: 0.9,
+        maxOutputTokens: 2000,
+        thinkingConfig: { thinkingBudget: 0 },
+      },
     });
     return text.trim();
   } catch (error) {
