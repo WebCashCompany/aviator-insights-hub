@@ -40,6 +40,8 @@ function buildCandleStats(candles: Candle[]) {
   const roxo60 = count(last60, c => c.cor === 'purple');
   const rosa60 = count(last60, c => c.cor === 'pink');
   const azul20 = count(last20, c => c.cor === 'blue');
+  const roxo20 = count(last20, c => c.cor === 'purple');
+  const rosa20 = count(last20, c => c.cor === 'pink');
   const maxMult = Math.max(...last60.map(c => c.multiplicador));
   const minMult = Math.min(...last60.map(c => c.multiplicador));
 
@@ -50,12 +52,19 @@ function buildCandleStats(candles: Candle[]) {
     else break;
   }
 
-  let maxAzulStreak = 0;
-  let currentAzul   = 0;
+  let maxAzulStreak = 0, currentAzul = 0;
+  let maxRoxoStreak = 0, currentRoxo = 0;
   for (const c of last60) {
-    if (c.cor === 'blue') { currentAzul++; maxAzulStreak = Math.max(maxAzulStreak, currentAzul); }
-    else currentAzul = 0;
+    if (c.cor === 'blue') {
+      currentAzul++; maxAzulStreak = Math.max(maxAzulStreak, currentAzul); currentRoxo = 0;
+    } else if (c.cor === 'purple') {
+      currentRoxo++; maxRoxoStreak = Math.max(maxRoxoStreak, currentRoxo); currentAzul = 0;
+    } else {
+      currentAzul = 0; currentRoxo = 0;
+    }
   }
+
+  const last5detail = reversed.slice(0, 5).map(c => `${c.multiplicador}x(${c.cor})`).join(' → ');
 
   return {
     j60: {
@@ -65,11 +74,18 @@ function buildCandleStats(candles: Candle[]) {
       rosa:  { n: rosa60, p: pct(rosa60, last60.length) },
       avg:   avg(last60),
     },
-    j20: { azulN: azul20, azulP: pct(azul20, last20.length), avg: avg(last20) },
+    j20: {
+      azulN: azul20, azulP: pct(azul20, last20.length),
+      roxoN: roxo20, roxoP: pct(roxo20, last20.length),
+      rosaN: rosa20, rosaP: pct(rosa20, last20.length),
+      avg: avg(last20),
+    },
     u10: last10.map(c => `${c.multiplicador}x`).join(','),
+    last5detail,
     ultimaVela: last10[0] ? `${last10[0].multiplicador}x (${last10[0].cor})` : 'N/A',
     streak: { cor: streakCor, n: streak },
     maxAzulStreak,
+    maxRoxoStreak,
     max: maxMult.toFixed(2),
     min: minMult.toFixed(2),
   };
@@ -120,41 +136,43 @@ export async function askAIAboutPatterns(
   candles: Candle[],
   history: { role: string; content: string }[] = [],
 ): Promise<string> {
-  const stats   = buildCandleStats(candles);
+  const stats = buildCandleStats(candles);
 
-  const systemMsg = `Você é um consultor especialista em Aviator Crash Game. Regras obrigatórias:
-- Responda em texto simples, SEM markdown, SEM asteriscos, SEM negrito
-- Seja direto e específico com os números reais abaixo
-- Máximo 3 frases curtas
-- Nunca use expressões genéricas como "considerável" ou "sugerem"
-- Sempre cite os números exatos dos dados fornecidos
-- Estratégia máxima: 1 entrada + 1 martingale, se perder os dois PARE
+  const systemMsg = `Você é um consultor especialista em Aviator Crash Game. Responda em texto simples, SEM markdown, SEM asteriscos, SEM negrito.
 
-Dados atuais:
+DADOS EM TEMPO REAL:
+- Últimas 5 velas: ${stats.last5detail}
 - Últimas 10 velas: ${stats.u10}
 - Última vela: ${stats.ultimaVela}
-- Streak atual: ${stats.streak.n} velas ${stats.streak.cor} seguidas
-- Últimas 60 velas: ${stats.j60.azul.p}% azuis (${stats.j60.azul.n}), ${stats.j60.roxo.p}% roxas (${stats.j60.roxo.n}), ${stats.j60.rosa.p}% rosas (${stats.j60.rosa.n})
-- Últimas 20 velas: ${stats.j20.azulP}% azuis (${stats.j20.azulN})
-- Média multiplicador 60v: ${stats.j60.avg}x | Média 20v: ${stats.j20.avg}x
-- Maior sequência azul: ${stats.maxAzulStreak}
-- Máximo: ${stats.max}x | Mínimo: ${stats.min}x`;
+- Streak atual: ${stats.streak.n} vela(s) ${stats.streak.cor} consecutiva(s)
 
+Últimas 20 velas: azul ${stats.j20.azulN}/20 (${stats.j20.azulP}%), roxo ${stats.j20.roxoN}/20 (${stats.j20.roxoP}%), rosa ${stats.j20.rosaN}/20 (${stats.j20.rosaP}%), média ${stats.j20.avg}x
+Últimas 60 velas: azul ${stats.j60.azul.n}/60 (${stats.j60.azul.p}%), roxo ${stats.j60.roxo.n}/60 (${stats.j60.roxo.p}%), rosa ${stats.j60.rosa.n}/60 (${stats.j60.rosa.p}%), média ${stats.j60.avg}x
+Maior sequência azul: ${stats.maxAzulStreak} | Maior sequência roxa: ${stats.maxRoxoStreak}
+Máximo: ${stats.max}x | Mínimo: ${stats.min}x
+
+REGRAS:
+- Use os números acima para justificar cada resposta
+- Seja direto, máximo 3 frases
+- Nunca use palavras vagas como "considerável", "pode ser", "sugere"
+- Se perguntarem sobre chance de uma cor, calcule com base nos dados reais
+- Estratégia máxima: 1 entrada + 1 martingale. Se perder os dois, pare.`;
+
+  // O histórico já inclui a pergunta atual (enviado pelo AI.tsx)
   const contents = [
     { role: 'user',  parts: [{ text: systemMsg }] },
-    { role: 'model', parts: [{ text: 'Entendido. Vou responder com dados precisos e sem markdown.' }] },
-    ...history.slice(-6).map(m => ({
+    { role: 'model', parts: [{ text: 'Entendido. Responderei com dados precisos e sem formatação.' }] },
+    ...history.slice(-10).map(m => ({
       role:  m.role === 'assistant' ? 'model' : 'user',
       parts: [{ text: m.content }],
     })),
-    { role: 'user', parts: [{ text: question }] },
   ];
 
   try {
     const text = await callGemini(MODEL_CHAT, {
       contents,
       generationConfig: {
-        temperature: 0.4,
+        temperature: 0.3,
         topP: 0.9,
         maxOutputTokens: 2000,
         thinkingConfig: { thinkingBudget: 0 },

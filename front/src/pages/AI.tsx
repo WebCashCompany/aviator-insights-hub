@@ -135,7 +135,11 @@ export default function AIPage() {
     setChatMessages(prev => [...prev, userMsg])
     setIsTyping(true)
 
-    const history = chatMessages.map(m => ({ role: m.role, content: m.content }))
+    // Histórico inclui mensagens anteriores + pergunta atual
+    const history = [
+      ...chatMessages.map(m => ({ role: m.role, content: m.content })),
+      { role: 'user', content: text },
+    ]
 
     try {
       const aiText = await askAIAboutPatterns(text, candles, history)
@@ -183,10 +187,7 @@ export default function AIPage() {
             <p className="text-xs text-muted-foreground mt-0.5">Motor IA · {candles.length} velas</p>
           </div>
         </div>
-        <div className="text-right">
-          <p className="text-[10px] text-muted-foreground uppercase font-semibold tracking-widest">Banca</p>
-          <p className="text-lg font-mono font-bold text-primary">$500.00</p>
-        </div>
+        
       </header>
 
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
