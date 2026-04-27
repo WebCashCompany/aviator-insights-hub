@@ -121,25 +121,40 @@ export async function askAIAboutPatterns(
   history: { role: string; content: string }[] = [],
 ): Promise<string> {
   const stats   = buildCandleStats(candles);
-  const context = `Última vela: ${stats.ultimaVela} | Sequência recente: ${stats.u10} | 60v: ${stats.j60.azul.p}% azuis ${stats.j60.roxo.p}% roxas ${stats.j60.rosa.p}% rosas | Média: ${stats.j60.avg}x | Streak atual: ${stats.streak.n}x ${stats.streak.cor}`;
 
-  const systemMsg = `Assistente estratégico de Aviator Crash Game. Responda direto, conciso, em português. Máximo 1 entrada + 1 martingale. Se perder os dois, PARAR. Máximo 3 parágrafos curtos.`;
+  const systemMsg = `Você é um consultor especialista em Aviator Crash Game. Regras obrigatórias:
+- Responda em texto simples, SEM markdown, SEM asteriscos, SEM negrito
+- Seja direto e específico com os números reais abaixo
+- Máximo 3 frases curtas
+- Nunca use expressões genéricas como "considerável" ou "sugerem"
+- Sempre cite os números exatos dos dados fornecidos
+- Estratégia máxima: 1 entrada + 1 martingale, se perder os dois PARE
+
+Dados atuais:
+- Últimas 10 velas: ${stats.u10}
+- Última vela: ${stats.ultimaVela}
+- Streak atual: ${stats.streak.n} velas ${stats.streak.cor} seguidas
+- Últimas 60 velas: ${stats.j60.azul.p}% azuis (${stats.j60.azul.n}), ${stats.j60.roxo.p}% roxas (${stats.j60.roxo.n}), ${stats.j60.rosa.p}% rosas (${stats.j60.rosa.n})
+- Últimas 20 velas: ${stats.j20.azulP}% azuis (${stats.j20.azulN})
+- Média multiplicador 60v: ${stats.j60.avg}x | Média 20v: ${stats.j20.avg}x
+- Maior sequência azul: ${stats.maxAzulStreak}
+- Máximo: ${stats.max}x | Mínimo: ${stats.min}x`;
 
   const contents = [
     { role: 'user',  parts: [{ text: systemMsg }] },
-    { role: 'model', parts: [{ text: 'Entendido. Estou pronto para ajudar.' }] },
+    { role: 'model', parts: [{ text: 'Entendido. Vou responder com dados precisos e sem markdown.' }] },
     ...history.slice(-6).map(m => ({
       role:  m.role === 'assistant' ? 'model' : 'user',
       parts: [{ text: m.content }],
     })),
-    { role: 'user', parts: [{ text: `Contexto: ${context}\n\nPergunta: ${question}` }] },
+    { role: 'user', parts: [{ text: question }] },
   ];
 
   try {
     const text = await callGemini(MODEL_CHAT, {
       contents,
       generationConfig: {
-        temperature: 0.6,
+        temperature: 0.4,
         topP: 0.9,
         maxOutputTokens: 2000,
         thinkingConfig: { thinkingBudget: 0 },
